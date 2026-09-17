@@ -7,13 +7,16 @@ then emits inspectable C++20 coroutine source.  No CUDA SDK or GPU is needed.
 ## Build and use
 
 ```sh
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
+make
+make test
 ./cuda2omp examples/reverse.cu -o reverse.cpp
 clang++ -std=c++20 -fopenmp -Iruntime reverse.cpp -o reverse
 ./reverse
 ```
+
+The compiler is a Python executable, so `make` has no compilation work to do.
+Use `make install` to install it and its runtime header under `/usr/local`, or
+override `PREFIX` and `DESTDIR` for another location or a staged package.
 
 The emitted `.cpp` is the requested inspectable intermediate form. Set `CLANG`
 or pass `--clang` to select a compatible Clang with CUDA parsing support.
