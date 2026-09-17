@@ -76,6 +76,13 @@ functions; nested device calls; barriers in kernels or device callees; ordinary
 C++ expressions, conditionals, loops, and returns. Kernel arguments must remain
 valid until the synchronous launch returns.
 
+Before opening the requested output, a validation pass checks explicit
+allowlists for CUDA declarations, expressions, storage attributes, builtin
+members, call targets, launch forms, and shared-memory declarations. Every
+unsupported AST construct is reported as `file:line:column: error: message`,
+and validation failure leaves an existing output untouched. In particular,
+only the `.x` member of CUDA's index and dimension builtins is accepted.
+
 ## Unsupported and known limitations
 
 Dynamic shared memory, multidimensional launches, streams/asynchrony, atomics,

@@ -22,6 +22,167 @@ def refname(n):
         if x.get("kind") == "DeclRefExpr" and x.get("referencedDecl"):
             return x["referencedDecl"].get("name")
 
+def resolved_callee(n):
+    """Return the declaration behind a direct call, not a referenced variable."""
+    if not n.get("inner"): return None
+    for x in walk(n["inner"][0]):
+        if x.get("kind")=="DeclRefExpr": return x.get("referencedDecl")
+
+# These sets are deliberately explicit.  Adding syntax to the lowerer requires
+# adding it here too, so an unfamiliar CUDA AST node can never silently leak
+# into the generated host program.
+CUDA_DECLARATIONS = {"FunctionDecl", "ParmVarDecl", "VarDecl"}
+CUDA_EXPRESSIONS = {
+    "ArraySubscriptExpr", "BinaryOperator", "BreakStmt", "CallExpr",
+    "CompoundAssignOperator", "CompoundStmt", "ConditionalOperator",
+    "CStyleCastExpr", "CXXBoolLiteralExpr", "CXXFunctionalCastExpr",
+    "CXXStaticCastExpr", "DeclRefExpr", "DeclStmt", "DoStmt", "FloatingLiteral",
+    "ForStmt", "IfStmt", "ImplicitCastExpr", "IntegerLiteral", "MemberExpr",
+    "NullStmt", "ParenExpr", "ReturnStmt", "UnaryOperator", "VarDecl", "WhileStmt",
+}
+CUDA_BUILTINS = {"threadIdx", "blockIdx", "blockDim", "gridDim"}
+CUDA_BUILTIN_MEMBERS = {"x"}
+CUDA_LAUNCH_FORMS = {"CUDAKernelCallExpr", "cudaLaunchKernel"}
+CUDA_STORAGE_ATTRIBUTES = {"CUDADeviceAttr", "CUDAGlobalAttr", "CUDASharedAttr"}
+CUDA_CALL_TARGETS = {"__syncthreads"} # CUDA functions in this TU are added below.
+
+def point(n, which="begin"):
+    p=n.get("range",{}).get(which) or n.get("loc",{})
+    return p.get("expansionLoc",p)
+
+def in_main(n, size):
+    p=point(n)
+    return "includedFrom" not in p and p.get("offset",size+1) <= size
+
+def validate(tree, src, filename):
+    """Validate the complete CUDA subset before the first output-side effect."""
+    errors=[]; size=len(src); absolute=str(pathlib.Path(filename).resolve())
+    parents={}
+    def index(n):
+        for c in n.get("inner",[]): parents[id(c)]=n; index(c)
+    index(tree)
+    def complain(n, message):
+        p=point(n); off=p.get("offset")
+        # Clang sometimes omits repeated line/column fields in JSON.
+        if in_main(n,size) and off is not None:
+            line=src.count("\n",0,off)+1; start=src.rfind("\n",0,off)+1; col=off-start+1
+            path=absolute
+        else:
+            path=p.get("file") or p.get("includedFrom",{}).get("file") or absolute
+            line=p.get("line",1); col=p.get("col",1)
+        errors.append((path,line,col,message))
+    def macro_range(n):
+        for which in ("begin","end"):
+            p=n.get("range",{}).get(which,{})
+            if "spellingLoc" not in p: continue
+            spelling=p["spellingLoc"]; expansion=p.get("expansionLoc",{})
+            # CUDA keywords are macros in our forced shim; unlike a user macro,
+            # their spelling lives in an included file and is safe to ignore.
+            if expansion.get("isMacroArgExpansion") or "includedFrom" not in spelling:
+                return True
+        return False
+    nodes=list(walk(tree))
+    cuda_funcs=[]
+    for n in nodes:
+        attrs={x.get("kind") for x in n.get("inner",[]) if x.get("kind")}
+        cuda_attrs=attrs & CUDA_STORAGE_ATTRIBUTES
+        unknown_cuda_attrs={a for a in attrs if a.startswith("CUDA") and a.endswith("Attr")} - CUDA_STORAGE_ATTRIBUTES
+        if in_main(n,size) and unknown_cuda_attrs:
+            complain(n,"unsupported CUDA storage attribute "+", ".join(sorted(unknown_cuda_attrs)))
+        if n.get("kind")=="FunctionDecl" and attrs & {"CUDADeviceAttr","CUDAGlobalAttr"}:
+            if n.get("isImplicit"):
+                continue
+            # Ignore shim/system machinery but reject user CUDA declarations in includes.
+            if in_main(n,size):
+                if child(n,"CompoundStmt"): cuda_funcs.append(n)
+                else: complain(n,"CUDA function declarations without a definition are unsupported")
+            else:
+                p=point(n)
+                origin=p.get("file","")
+                if origin.endswith((".cu",".cuh")):
+                    complain(n,"CUDA declaration from a non-main file is unsupported")
+        if in_main(n,size) and cuda_attrs and n.get("kind") not in CUDA_DECLARATIONS:
+            complain(n,f"CUDA attribute on unsupported declaration {n.get('kind')}" )
+        if in_main(n,size) and attrs & ({"CUDAConstantAttr","CUDAManagedAttr"}):
+            complain(n,"device/global CUDA variables are unsupported")
+        if in_main(n,size) and n.get("kind")=="VarDecl" and attrs & {"CUDADeviceAttr","CUDAGlobalAttr"}:
+            complain(n,"device/global CUDA variables are unsupported")
+        if in_main(n,size) and n.get("kind") in {"FunctionTemplateDecl","ClassTemplateDecl","VarTemplateDecl"}:
+            complain(n,"templates are unsupported")
+    names={f.get("name") for f in cuda_funcs}
+    kernel_names={f.get("name") for f in cuda_funcs if any(x.get("kind")=="CUDAGlobalAttr" for x in f.get("inner",[]))}
+    byname={name:[f for f in cuda_funcs if f.get("name")==name] for name in names}
+    for name, fs in byname.items():
+        if len(fs)>1:
+            for f in fs: complain(f,f"overloaded CUDA function '{name}' is ambiguous")
+    edges={name:set() for name in names}
+    for f in cuda_funcs:
+        body=child(f,"CompoundStmt")
+        if not body: continue
+        is_kernel=any(x.get("kind")=="CUDAGlobalAttr" for x in f.get("inner",[]))
+        for n in walk(body):
+            kind=n.get("kind")
+            if kind not in CUDA_EXPRESSIONS and not kind.endswith("Attr"):
+                complain(n,f"unsupported CUDA expression {kind}")
+            if kind=="MemberExpr":
+                base=refname(n)
+                if base in CUDA_BUILTINS and n.get("name") not in CUDA_BUILTIN_MEMBERS:
+                    complain(n,f".{n.get('name')} of {base} is unsupported; only .x is supported")
+            if kind=="CallExpr":
+                callee=resolved_callee(n); target=callee.get("name") if callee else None
+                if not callee or callee.get("kind") not in {"FunctionDecl","FunctionTemplateDecl"}:
+                    complain(n,"indirect calls are unsupported")
+                elif target not in CUDA_CALL_TARGETS | names:
+                    complain(n,f"call target '{target}' is unsupported in CUDA code")
+                elif target in names: edges[f.get("name")].add(target)
+            if kind=="VarDecl":
+                attrs={x.get("kind") for x in n.get("inner",[])}
+                if "CUDASharedAttr" in attrs:
+                    declstmt=parents.get(id(n)); scope=parents.get(id(declstmt))
+                    typ=n.get("type",{}).get("qualType","")
+                    if not is_kernel or not declstmt or declstmt.get("kind")!="DeclStmt" or scope is not body:
+                        complain(n,"shared declaration must be directly kernel-local")
+                    elif n.get("storageClass")!="static" or "[" not in typ or not typ.rstrip().endswith("]") or "[]" in typ:
+                        complain(n,"only fixed-size kernel-local shared arrays are supported")
+            # Rewritten ranges must have a single main-file spelling.
+            if kind in {"MemberExpr","CallExpr","VarDecl"}:
+                if macro_range(n):
+                    complain(n,"macro range cannot be rewritten")
+    visiting=set(); done=set()
+    def dfs(name):
+        if name in visiting: return True
+        if name in done: return False
+        visiting.add(name)
+        recursive=any(dfs(c) for c in edges[name])
+        visiting.remove(name); done.add(name)
+        return recursive
+    for name in names:
+        if dfs(name): complain(byname[name][0],f"recursive CUDA call involving '{name}' is unsupported")
+    for n in nodes:
+        if not in_main(n,size): continue
+        if n.get("kind")=="CUDAKernelCallExpr":
+            if refname(n) not in kernel_names: complain(n,"launch target is not a supported kernel definition")
+            raw=source_text(src,n) or ""
+            p=raw.find("<<<"); q=raw.find(">>>",p)
+            if p<0 or q<0 or len(raw[p+3:q].split(','))!=2:
+                complain(n,"only <<<grid, block>>> launches are supported")
+            if macro_range(n):
+                complain(n,"macro range cannot be rewritten")
+        elif n.get("kind")=="CallExpr" and refname(n)=="cudaLaunchKernel":
+            parts=n.get("inner",[])
+            if len(parts)<5: complain(n,"malformed cudaLaunchKernel launch")
+            else:
+                target=refname(parts[1]) if len(parts)>1 else None
+                if target not in kernel_names: complain(n,"cudaLaunchKernel target is not a supported kernel definition")
+                actual=[source_text(src,p) for p in parts[5:7]]
+                allowed=({"0"},{"0","nullptr","NULL"})
+                if any(v is not None and v.strip() not in allowed[i] for i,v in enumerate(actual)):
+                    complain(n,"dynamic shared memory and streams are unsupported")
+    if errors:
+        for path,line,col,message in errors:
+            print(f"{path}:{line}:{col}: error: {message}",file=sys.stderr)
+        raise SystemExit(1)
+
 def ast(source, clang):
     cmd=[clang,"-std=c++20","-x","cuda","--cuda-host-only","-nocudainc","-nocudalib",
          "-include",str(SHIM),"-Xclang","-ast-dump=json","-fsyntax-only",source]
@@ -84,6 +245,7 @@ def main():
     ap.add_argument("input"); ap.add_argument("-o","--output",required=True)
     ap.add_argument("--clang",default=os.environ.get("CLANG","clang++"))
     ns=ap.parse_args(); src=pathlib.Path(ns.input).read_text(); tree=ast(ns.input,ns.clang)
+    validate(tree,src,ns.input)
     funcs=[]
     for n in walk(tree):
         if n.get("kind")!="FunctionDecl" or not child(n,"CompoundStmt"): continue

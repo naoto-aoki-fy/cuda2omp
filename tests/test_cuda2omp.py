@@ -56,6 +56,46 @@ class Tests(unittest.TestCase):
    p=subprocess.run([str(exe)],text=True,capture_output=True)
    self.assertEqual(p.returncode,0,p.stdout+p.stderr)
 
+ def assert_rejected(self, code, expected):
+  with tempfile.TemporaryDirectory() as d:
+   d=pathlib.Path(d); cu=d/'in.cu'; cpp=d/'out.cpp'
+   cu.write_text(textwrap.dedent(code)); cpp.write_text('sentinel')
+   p=subprocess.run([str(ROOT/'cuda2omp'),str(cu),'-o',str(cpp)],text=True,capture_output=True)
+   self.assertNotEqual(p.returncode,0,p.stderr)
+   self.assertIn(expected,p.stderr)
+   self.assertRegex(p.stderr,rf'{cu}:\d+:\d+: (?:error: )?')
+   self.assertEqual(cpp.read_text(),'sentinel','validation modified the output file')
+
+ def test_validation_rejections(self):
+  cases={
+   'builtin member': ('__global__ void k(){int i=threadIdx.y;} int main(){k<<<1,1>>>();}', 'only .x'),
+   'template': ('template<class T> __device__ T f(T x){return x;} __global__ void k(){}', 'templates are unsupported'),
+   'overload': ('__device__ int f(int x){return x;} __device__ int f(long x){return x;} __global__ void k(){}', 'overloaded CUDA function'),
+   'indirect call': ('__device__ int f(int x){return x;} __global__ void k(){int(*p)(int)=f; p(1);}', 'indirect calls'),
+   'recursion': ('__device__ int f(int x){return x?f(x-1):0;} __global__ void k(){f(1);}', 'recursive CUDA call'),
+   'macro range': ('#define TID threadIdx.x\n__global__ void k(){int x=TID;}', 'macro range'),
+   'dynamic shared': ('__global__ void k(){extern __shared__ int x[];}', 'fixed-size kernel-local'),
+   'stream': ('__global__ void k(){} int main(){k<<<1,1,0,(void*)1>>>();}', 'only <<<grid, block>>>'),
+   'device variable': ('__device__ int value; __global__ void k(){}', 'device/global CUDA variables'),
+   'shared in device': ('__device__ void f(){__shared__ int x[2];} __global__ void k(){f();}', 'directly kernel-local'),
+   'shared scalar': ('__global__ void k(){__shared__ int x;}', 'fixed-size kernel-local'),
+   'unsupported expression': ('__global__ void k(int x){switch(x){case 1: break;}}', 'unsupported CUDA expression SwitchStmt'),
+   'unsupported target': ('__device__ int other(int); __global__ void k(){other(1);}', "call target 'other' is unsupported"),
+   'launch dimensions': ('__global__ void k(){} int main(){k<<<1,1,0>>>();}', 'only <<<grid, block>>>'),
+  }
+  for label,(code,message) in cases.items():
+   with self.subTest(label=label): self.assert_rejected(code,message)
+
+ def test_cuda_declaration_in_header_is_rejected(self):
+  with tempfile.TemporaryDirectory() as d:
+   d=pathlib.Path(d); header=d/'device.cuh'; cu=d/'in.cu'; out=d/'out.cpp'
+   header.write_text('__device__ int from_header(){return 1;}\n')
+   cu.write_text('#include "device.cuh"\n__global__ void k(){from_header();}\n')
+   p=subprocess.run([str(ROOT/'cuda2omp'),str(cu),'-o',str(out)],text=True,capture_output=True)
+   self.assertNotEqual(p.returncode,0,p.stderr)
+   self.assertIn('non-main file',p.stderr)
+   self.assertFalse(out.exists())
+
  def test_all_semantics(self):
   self.run_cuda(r'''
    __device__ int square(int x) { return x*x; }
