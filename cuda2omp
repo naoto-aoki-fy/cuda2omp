@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""AST-directed CUDA-to-C++20 coroutine prototype."""
+import argparse, json, os, pathlib, subprocess, sys, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent
+SHIM = ROOT / "runtime" / "cuda_frontend_shim.hpp"
+
+def loc(n, which):
+    x = n["range"][which]
+    x = x.get("expansionLoc", x)
+    return x.get("offset"), x.get("tokLen", 1)
+
+def walk(n):
+    yield n
+    for c in n.get("inner", []): yield from walk(c)
+
+def child(n, kind):
+    return next((x for x in n.get("inner", []) if x.get("kind") == kind), None)
+
+def refname(n):
+    for x in walk(n):
+        if x.get("kind") == "DeclRefExpr" and x.get("referencedDecl"):
+            return x["referencedDecl"].get("name")
+
+def ast(source, clang):
+    cmd=[clang,"-std=c++20","-x","cuda","--cuda-host-only","-nocudainc","-nocudalib",
+         "-include",str(SHIM),"-Xclang","-ast-dump=json","-fsyntax-only",source]
+    p=subprocess.run(cmd,text=True,capture_output=True)
+    if p.returncode:
+        sys.stderr.write(p.stderr); raise SystemExit("cuda2omp: Clang CUDA parse failed")
+    return json.loads(p.stdout)
+
+def apply(text, edits):
+    for a,b,s in sorted(edits, reverse=True): text=text[:a]+s+text[b:]
+    return text
+
+def transform_body(src, body, device_names, shared_nodes, ret):
+    a,_=loc(body,"begin"); z,l=loc(body,"end"); base=a; text=src[a:z+l]; edits=[]
+    shared_names={v["name"] for v in shared_nodes}
+    nodes=list(walk(body))
+    # Semantic references to CUDA builtins and block shared declarations.
+    for n in nodes:
+        if n.get("kind")=="MemberExpr":
+            rn=refname(n)
+            if rn in {"threadIdx","blockIdx","blockDim","gridDim"}:
+                x,_=loc(n,"begin"); y,tl=loc(n,"end"); edits.append((x-base,y+tl-base,"ctx."+rn+"_x"))
+        if n.get("kind")=="DeclRefExpr" and n.get("referencedDecl",{}).get("name") in shared_names:
+            x,_=loc(n,"begin"); y,tl=loc(n,"end"); name=n["referencedDecl"]["name"]
+            edits.append((x-base,y+tl-base,"shared."+name))
+    # Calls are based on resolved declarations, not spelling patterns.
+    for n in nodes:
+        if n.get("kind")!="CallExpr": continue
+        name=refname(n)
+        x,_=loc(n,"begin")
+        if name=="__syncthreads":
+            y,tl=loc(n,"end"); edits.append((x-base,y+tl-base,"co_await ctx.syncthreads()"))
+        elif name in device_names:
+            edits.append((x-base,x-base,"co_await "))
+            dr=next((q for q in walk(n) if q.get("kind")=="DeclRefExpr" and q.get("referencedDecl",{}).get("name")==name),None)
+            if dr:
+                dx,_=loc(dr,"begin"); dy,dt=loc(dr,"end"); edits.append((dx-base,dy+dt-base,name+"_cpu"))
+            # AST identifies the call; locate its already parsed opening token.
+            y,tl=loc(n,"end"); op=src.find('(',x,y+tl)
+            if op>=0:
+                following=src[op+1:y+tl-1].strip(); edits.append((op+1-base,op+1-base,"ctx"+(", " if following else "")))
+    for v in shared_nodes:
+        x,_=loc(v,"begin"); y,tl=loc(v,"end"); semi=src.find(';',y+tl,y+tl+3)
+        edits.append((x-base,semi+1-base,""))
+    for q in walk(body):
+        if q.get("kind")=="ReturnStmt":
+            x,_=loc(q,"begin"); edits.append((x-base,x-base+6,"co_return"))
+    if ret=="void": edits.append((z-base,z-base," co_return;"))
+    return apply(text,edits)
+
+def main():
+    ap=argparse.ArgumentParser(description="Lower a restricted CUDA TU to CPU C++20/OpenMP")
+    ap.add_argument("input"); ap.add_argument("-o","--output",required=True)
+    ap.add_argument("--clang",default=os.environ.get("CLANG","clang++"))
+    ns=ap.parse_args(); src=pathlib.Path(ns.input).read_text(); tree=ast(ns.input,ns.clang)
+    funcs=[]
+    for n in walk(tree):
+        if n.get("kind")!="FunctionDecl" or not child(n,"CompoundStmt"): continue
+        b=child(n,"CompoundStmt"); x,_=loc(b,"begin")
+        if x is not None and x < len(src): funcs.append(n)
+    cuda=[]
+    for f in funcs:
+        attrs={x.get("kind") for x in f.get("inner",[])}
+        if "CUDADeviceAttr" in attrs or "CUDAGlobalAttr" in attrs: cuda.append(f)
+    names={f["name"] for f in cuda}
+    direct={f["name"]: any(refname(x)=="__syncthreads" for x in walk(child(f,"CompoundStmt")) if x.get("kind")=="CallExpr") for f in cuda}
+    calls={f["name"]:{refname(x) for x in walk(child(f,"CompoundStmt")) if x.get("kind")=="CallExpr"} & names for f in cuda}
+    changed=True
+    while changed:
+        changed=False
+        for n in names:
+            if not direct[n] and any(direct[c] for c in calls[n]): direct[n]=True; changed=True
+    kernels=[f for f in cuda if any(x.get("kind")=="CUDAGlobalAttr" for x in f.get("inner",[]))]
+    shared_by_kernel={}
+    generated=[]
+    for f in cuda:
+        body=child(f,"CompoundStmt"); shared=[]
+        for v in walk(body):
+            if v.get("kind")=="VarDecl" and v.get("storageClass")=="static" and any(x.get("kind")=="CUDASharedAttr" for x in v.get("inner",[])):
+                shared.append(v)
+        shared_names={v["name"] for v in shared}; shared_by_kernel[f["name"]]=shared
+        ret=f.get("type",{}).get("qualType","void ()").split(" (")[0]
+        params=[]
+        for p in (x for x in f.get("inner",[]) if x.get("kind")=="ParmVarDecl"):
+            params.append(p.get("type",{}).get("qualType","int")+" "+p.get("name","arg"))
+        iskernel=f in kernels
+        st=f"Shared_{f['name']}" if iskernel else None
+        if iskernel:
+            fields=[]
+            for v in shared:
+                typ=v.get("type",{}).get("qualType","int")
+                if "[" in typ:
+                    base_t,suffix=typ.split("[",1); fields.append(f"  {base_t} {v['name']}[{suffix};")
+                else: fields.append(f"  {typ} {v['name']};")
+            generated.append(f"struct {st} {{\n"+"\n".join(fields)+"\n};")
+        prefix="cuda2omp::Task<"+ret+"> "+f["name"]+"_cpu(cuda2omp::ThreadContext& ctx"
+        if iskernel: prefix+=f", {st}& shared"
+        if params: prefix+=", "+", ".join(params)
+        prefix+=") "
+        btext=transform_body(src,body,names,shared,ret)
+        generated.append(prefix+btext)
+    # Remove CUDA declarations and transform launch expressions from AST nodes.
+    edits=[]
+    for f in cuda:
+        x,_=loc(f,"begin"); y,tl=loc(f,"end"); edits.append((x,y+tl,""))
+    for n in walk(tree):
+        if n.get("kind")!="CUDAKernelCallExpr": continue
+        name=refname(n)
+        if name not in {f['name'] for f in kernels}: continue
+        x,_=loc(n,"begin"); y,tl=loc(n,"end"); raw=src[x:y+tl]
+        # AST confirms this is a launch; spelling is used only to preserve argument expressions.
+        p=raw.find("<<<"); q=raw.find(">>>",p); cfg=raw[p+3:q].split(','); args=raw[raw.find('(',q)+1:raw.rfind(')')]
+        if len(cfg)!=2: raise SystemExit("cuda2omp: only <<<grid, block>>> is supported")
+        comma=(", "+args) if args.strip() else ""
+        repl=f"cuda2omp::launch<{name and 'Shared_'+name}>({cfg[0]}, {cfg[1]}, [&](cuda2omp::ThreadContext& ctx, Shared_{name}& shared) {{ return {name}_cpu(ctx, shared{comma}); }})"
+        edits.append((x,y+tl,repl))
+    host=apply(src,edits)
+    out='#include "cuda2omp_runtime.hpp"\n'+"\n".join(generated)+"\n"+host
+    pathlib.Path(ns.output).write_text(out)
+    print("cuda2omp: kernels="+",".join(f['name'] for f in kernels),file=sys.stderr)
+    print("cuda2omp: barrier-capable="+",".join(sorted(n for n,v in direct.items() if v)),file=sys.stderr)
+if __name__=="__main__": main()
