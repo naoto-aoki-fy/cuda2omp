@@ -35,4 +35,18 @@ class Tests(unittest.TestCase):
      for(int i=0;i<8;++i)if(c[i] != ((7-i)+3)+(i+3)+i)return 3; }
   ''')
 
+ def test_cuda_launch_kernel(self):
+  self.run_cuda(r'''
+   __global__ void fill(int *x, int value) {
+     x[blockIdx.x*blockDim.x+threadIdx.x] = value;
+   }
+   int main() {
+     int x[8] = {}; int *output=x; int value=42;
+     void *args[] = {&output, &value};
+     int status=cudaLaunchKernel((const void*)fill, 2, 4, args, 0, nullptr);
+     if(status != 0) return 1;
+     for(int v:x) if(v != 42) return 2;
+   }
+  ''')
+
 if __name__=='__main__': unittest.main()

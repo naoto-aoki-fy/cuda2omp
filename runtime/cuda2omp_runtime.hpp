@@ -2,10 +2,18 @@
 #include <coroutine>
 #include <cstdlib>
 #include <iostream>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace cuda2omp {
+template<class T> decltype(auto) kernel_arg(void** args, unsigned index) {
+  return *static_cast<std::remove_reference_t<T>*>(args[index]);
+}
+template<class T> unsigned extent_x(const T& extent) {
+  if constexpr (requires { extent.x; }) return extent.x;
+  else return static_cast<unsigned>(extent);
+}
 template<class T=void> class Task;
 template<class T> struct Promise {
   T value{}; std::coroutine_handle<> continuation{};

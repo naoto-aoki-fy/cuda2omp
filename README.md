@@ -43,7 +43,8 @@ or pass `--clang` to select a compatible Clang with CUDA parsing support.
 
 ## Supported subset
 
-One-dimensional `<<<grid, block>>>` launches; `.x` of `threadIdx`, `blockIdx`,
+One-dimensional `<<<grid, block>>>` and `cudaLaunchKernel` launches; `.x` of
+`threadIdx`, `blockIdx`,
 `blockDim`, and `gridDim`; fixed-size kernel-local shared arrays; global/device
 functions; nested device calls; barriers in kernels or device callees; ordinary
 C++ expressions, conditionals, loops, and returns. Kernel arguments must remain
@@ -54,7 +55,8 @@ valid until the synchronous launch returns.
 Dynamic shared memory, multidimensional launches, streams/asynchrony, atomics,
 warp intrinsics, cooperative groups, textures, graphs, device allocation,
 dynamic parallelism, function pointers/recursion, templates, overloaded CUDA
-functions, and general CUDA runtime APIs are unsupported. Launch configuration
+functions, and general CUDA runtime APIs (apart from `cudaLaunchKernel`) are
+unsupported. Launch configuration
 must contain exactly two expressions. Shared storage is presently supported
 only when declared directly in a kernel. A legal barrier must be reached exactly
 once per phase by every logical thread; otherwise the runtime emits a divergent

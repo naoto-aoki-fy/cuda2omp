@@ -34,6 +34,13 @@ def apply(text, edits):
     for a,b,s in sorted(edits, reverse=True): text=text[:a]+s+text[b:]
     return text
 
+def source_text(src, n):
+    """Return the spelling covered by an AST node, excluding default arguments."""
+    if n.get("kind") == "CXXDefaultArgExpr" or "range" not in n: return None
+    a,_=loc(n,"begin"); z,l=loc(n,"end")
+    if a is None or z is None: return None
+    return src[a:z+l]
+
 def transform_body(src, body, device_names, shared_nodes, ret):
     a,_=loc(body,"begin"); z,l=loc(body,"end"); base=a; text=src[a:z+l]; edits=[]
     shared_names={v["name"] for v in shared_nodes}
@@ -96,6 +103,7 @@ def main():
             if not direct[n] and any(direct[c] for c in calls[n]): direct[n]=True; changed=True
     kernels=[f for f in cuda if any(x.get("kind")=="CUDAGlobalAttr" for x in f.get("inner",[]))]
     shared_by_kernel={}
+    params_by_kernel={}
     generated=[]
     for f in cuda:
         body=child(f,"CompoundStmt"); shared=[]
@@ -104,10 +112,12 @@ def main():
                 shared.append(v)
         shared_names={v["name"] for v in shared}; shared_by_kernel[f["name"]]=shared
         ret=f.get("type",{}).get("qualType","void ()").split(" (")[0]
-        params=[]
+        params=[]; param_types=[]
         for p in (x for x in f.get("inner",[]) if x.get("kind")=="ParmVarDecl"):
-            params.append(p.get("type",{}).get("qualType","int")+" "+p.get("name","arg"))
+            typ=p.get("type",{}).get("qualType","int")
+            params.append(typ+" "+p.get("name","arg")); param_types.append(typ)
         iskernel=f in kernels
+        if iskernel: params_by_kernel[f["name"]]=param_types
         st=f"Shared_{f['name']}" if iskernel else None
         if iskernel:
             fields=[]
@@ -128,15 +138,30 @@ def main():
     for f in cuda:
         x,_=loc(f,"begin"); y,tl=loc(f,"end"); edits.append((x,y+tl,""))
     for n in walk(tree):
-        if n.get("kind")!="CUDAKernelCallExpr": continue
-        name=refname(n)
+        if n.get("kind") not in {"CUDAKernelCallExpr", "CallExpr"}: continue
+        launch_api=n.get("kind")=="CallExpr" and refname(n)=="cudaLaunchKernel"
+        call_parts=n.get("inner",[])
+        name=refname(call_parts[1]) if launch_api and len(call_parts)>1 else refname(n)
         if name not in {f['name'] for f in kernels}: continue
         x,_=loc(n,"begin"); y,tl=loc(n,"end"); raw=src[x:y+tl]
-        # AST confirms this is a launch; spelling is used only to preserve argument expressions.
-        p=raw.find("<<<"); q=raw.find(">>>",p); cfg=raw[p+3:q].split(','); args=raw[raw.find('(',q)+1:raw.rfind(')')]
-        if len(cfg)!=2: raise SystemExit("cuda2omp: only <<<grid, block>>> is supported")
-        comma=(", "+args) if args.strip() else ""
-        repl=f"cuda2omp::launch<{name and 'Shared_'+name}>({cfg[0]}, {cfg[1]}, [&](cuda2omp::ThreadContext& ctx, Shared_{name}& shared) {{ return {name}_cpu(ctx, shared{comma}); }})"
+        if launch_api:
+            if len(call_parts)<5: raise SystemExit("cuda2omp: malformed cudaLaunchKernel call")
+            grid=source_text(src,call_parts[2]); block=source_text(src,call_parts[3]); argv=source_text(src,call_parts[4])
+            if not all(v is not None for v in (grid,block,argv)):
+                raise SystemExit("cuda2omp: malformed cudaLaunchKernel arguments")
+            actual=[source_text(src,p) for p in call_parts[5:7]]
+            allowed=({"0"}, {"0", "nullptr", "NULL"})
+            if any(v is not None and v.strip() not in allowed[i] for i,v in enumerate(actual)):
+                raise SystemExit("cuda2omp: dynamic shared memory and streams are unsupported")
+            unpack="".join(f", cuda2omp::kernel_arg<{typ}>({argv}, {i})" for i,typ in enumerate(params_by_kernel[name]))
+            repl=(f"(cuda2omp::launch<Shared_{name}>(cuda2omp::extent_x({grid}), cuda2omp::extent_x({block}), "
+                  f"[&](cuda2omp::ThreadContext& ctx, Shared_{name}& shared) {{ return {name}_cpu(ctx, shared{unpack}); }}), 0)")
+        else:
+            # AST confirms this is a launch; spelling is used only to preserve argument expressions.
+            p=raw.find("<<<"); q=raw.find(">>>",p); cfg=raw[p+3:q].split(','); args=raw[raw.find('(',q)+1:raw.rfind(')')]
+            if len(cfg)!=2: raise SystemExit("cuda2omp: only <<<grid, block>>> is supported")
+            comma=(", "+args) if args.strip() else ""
+            repl=f"cuda2omp::launch<Shared_{name}>({cfg[0]}, {cfg[1]}, [&](cuda2omp::ThreadContext& ctx, Shared_{name}& shared) {{ return {name}_cpu(ctx, shared{comma}); }})"
         edits.append((x,y+tl,repl))
     host=apply(src,edits)
     out='#include "cuda2omp_runtime.hpp"\n'+"\n".join(generated)+"\n"+host

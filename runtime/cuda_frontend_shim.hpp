@@ -9,3 +9,4 @@ extern const __device__ uint3 threadIdx, blockIdx, blockDim, gridDim;
 extern "C" int cudaConfigureCall(dim3, dim3, unsigned = 0, void* = nullptr);
 extern "C" int cudaSetupArgument(const void*, unsigned long, unsigned long);
 extern "C" int cudaLaunch(const void*);
+extern "C" int cudaLaunchKernel(const void*, dim3, dim3, void**, unsigned long = 0, void* = nullptr);
