@@ -14,9 +14,35 @@ clang++ -std=c++20 -fopenmp -Iruntime reverse.cpp -o reverse
 ./reverse
 ```
 
-The compiler is a Python executable, so `make` has no compilation work to do.
-Use `make install` to install it and its runtime header under `/usr/local`, or
-override `PREFIX` and `DESTDIR` for another location or a staged package.
+The existing compiler remains the `cuda2omp` Python executable while its
+replacement is developed. When LLVM and Clang development packages are
+available, `make` directly builds `build/cuda2omp-tool`, the C++ LibTooling
+parsing and rewrite layer. The build uses `llvm-config` for compiler and linker
+flags and does not require CMake. Use `make install` to install the available
+tools and runtime header under `/usr/local`, or override `PREFIX`, `DESTDIR`,
+`CXX`, or `LLVM_CONFIG` for another location or a staged package.
+
+## Native parsing and rewrite layer
+
+`cuda2omp-tool` obtains its compilation database with
+`CommonOptionsParser`/`ClangTool` and accepts normal LibTooling arguments. For
+example, the following parses one CUDA translation unit and exercises its
+resolved-reference rewrite primitive:
+
+```sh
+build/cuda2omp-tool -o rewritten.cu --rename=old_name=new_name input.cu -- \
+  -std=c++20 -x cuda --cuda-host-only -nocudainc -nocudalib \
+  -include "$PWD/runtime/cuda_frontend_shim.hpp"
+```
+
+Every prospective edit is checked using its Clang spelling location. The tool
+only rewrites tokens spelled in the main file and diagnoses CUDA declarations
+from headers, macro expansions, invalid locations, and non-rewritable ranges.
+This prevents byte offsets from an include or macro expansion from being
+applied to the main file (and also makes UTF-8 source safe). The Python
+transformer is intentionally still the production entry point until native
+lowering reproduces all existing examples; `--rename` is an integration
+primitive rather than the CUDA lowering interface.
 
 The emitted `.cpp` is the requested inspectable intermediate form. Set `CLANG`
 or pass `--clang` to select a compatible Clang with CUDA parsing support.

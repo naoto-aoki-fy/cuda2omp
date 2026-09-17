@@ -3,6 +3,47 @@ import pathlib, subprocess, tempfile, textwrap, unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 
 class Tests(unittest.TestCase):
+ def test_native_frontend_contract(self):
+  source=(ROOT/'native/cuda2omp_tool.cpp').read_text()
+  makefile=(ROOT/'Makefile').read_text()
+  self.assertIn('CommonOptionsParser::create',source)
+  self.assertIn('ClangTool Tool',source)
+  self.assertIn('SM.getSpellingLoc',source)
+  self.assertIn('SM.isWrittenInMainFile',source)
+  self.assertIn('Location.isMacroID()',source)
+  self.assertIn('Rewrite.ReplaceText',source)
+  self.assertIn('$(LLVM_CONFIG) --cxxflags',makefile)
+  self.assertNotIn('cmake',makefile.lower())
+
+ def test_native_utf8_and_location_fixture(self):
+  fixture=ROOT/'tests/fixtures/native_locations.cu'
+  text=fixture.read_text()
+  self.assertIn('café 🚀',text)
+  self.assertIn('namespace image',text)
+  self.assertIn('READ_PIXEL(amount)',text)
+  self.assertIn('Pixel amount',text)
+  self.assertTrue((fixture.parent/'included_device.cuh').is_file())
+
+  tool=ROOT/'build/cuda2omp-tool'
+  if not tool.is_file():
+   return
+  with tempfile.TemporaryDirectory() as d:
+   output=pathlib.Path(d)/'rewritten.cu'
+   command=[str(tool),'-o',str(output),'--rename=amount=replacement',
+            str(fixture),'--','-std=c++20','-x','cuda','--cuda-host-only',
+            '-nocudainc','-nocudalib','-include',
+            str(ROOT/'runtime/cuda_frontend_shim.hpp'),'-I',str(fixture.parent)]
+   p=subprocess.run(command,text=True,capture_output=True)
+   self.assertEqual(p.returncode,0,p.stderr)
+   rewritten=output.read_text()
+   self.assertIn('café 🚀',rewritten)
+   self.assertIn('from_header(replacement)',rewritten)
+   # A reference spelled through a macro is diagnosed and its definition is
+   # never changed as an accidental numeric-offset edit.
+   self.assertIn('#define READ_PIXEL(pixel) ((pixel).value)',rewritten)
+   self.assertIn('macro expansion',p.stderr)
+   self.assertIn('included file; not editing',p.stderr)
+
  def run_cuda(self, code):
   with tempfile.TemporaryDirectory() as d:
    d=pathlib.Path(d); cu=d/'in.cu'; cpp=d/'out.cpp'; exe=d/'a.out'; cu.write_text(textwrap.dedent(code))
