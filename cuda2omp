@@ -17,6 +17,10 @@ def walk(n):
 def child(n, kind):
     return next((x for x in n.get("inner", []) if x.get("kind") == kind), None)
 
+def has_cuda_attr(n):
+    attrs={x.get("kind") for x in n.get("inner",[])}
+    return bool(attrs & {"CUDADeviceAttr","CUDAGlobalAttr"})
+
 def refname(n):
     for x in walk(n):
         if x.get("kind") == "DeclRefExpr" and x.get("referencedDecl"):
@@ -107,7 +111,7 @@ def validate(tree, src, filename):
                 return True
         return False
     nodes=list(walk(tree))
-    cuda_funcs=[]
+    cuda_funcs=[]; cuda_decls=[]
     for n in nodes:
         attrs={x.get("kind") for x in n.get("inner",[]) if x.get("kind")}
         cuda_attrs=attrs & CUDA_STORAGE_ATTRIBUTES
@@ -119,8 +123,8 @@ def validate(tree, src, filename):
                 continue
             # Ignore shim/system machinery but reject user CUDA declarations in includes.
             if in_main(n,size):
+                cuda_decls.append(n)
                 if child(n,"CompoundStmt"): cuda_funcs.append(n)
-                else: complain(n,"CUDA function declarations without a definition are unsupported")
             else:
                 p=point(n)
                 origin=p.get("file","")
@@ -135,6 +139,10 @@ def validate(tree, src, filename):
         if in_main(n,size) and n.get("kind") in {"FunctionTemplateDecl","ClassTemplateDecl","VarTemplateDecl"}:
             complain(n,"templates are unsupported")
     functions={declarations.canonical(f):f for f in cuda_funcs}
+    for declaration in cuda_decls:
+        ident=declarations.canonical(declaration)
+        if not child(declaration,"CompoundStmt") and ident not in functions:
+            complain(declaration,"CUDA function declaration has no supported definition")
     kernels={declarations.canonical(f) for f in cuda_funcs if any(x.get("kind")=="CUDAGlobalAttr" for x in f.get("inner",[]))}
     edges={ident:set() for ident in functions}
     for f in cuda_funcs:
@@ -224,6 +232,31 @@ def source_text(src, n):
     if a is None or z is None: return None
     return src[a:z+l]
 
+def runtime_include_offset(src):
+    """Return the end of the source's leading include/pragma/trivia region."""
+    import re
+    offset=0; in_block=False
+    for line in src.splitlines(keepends=True):
+        stripped=line.lstrip()
+        trivia=in_block or not stripped.strip() or stripped.startswith(("//","/*"))
+        if in_block and "*/" in line: in_block=False
+        elif stripped.startswith("/*") and "*/" not in stripped: in_block=True
+        if trivia or re.match(r"#\s*(?:include|pragma)\b",stripped): offset+=len(line)
+        else: break
+    return offset
+
+def declaration_signature(f, ident, function_names, shared_types, kernel_ids):
+    """Create the common declaration/definition signature for a CUDA function."""
+    ret=f.get("type",{}).get("qualType","void ()").split(" (")[0]
+    params=[]; param_types=[]
+    for index,p in enumerate(x for x in f.get("inner",[]) if x.get("kind")=="ParmVarDecl"):
+        typ=p.get("type",{}).get("qualType","int")
+        params.append(typ+" "+(p.get("name") or f"cuda2omp_arg_{index}")); param_types.append(typ)
+    signature="cuda2omp::Task<"+ret+"> "+function_names[ident]+"(cuda2omp::ThreadContext& ctx"
+    if ident in kernel_ids: signature+=f", {shared_types[ident]}& shared"
+    if params: signature+=", "+", ".join(params)
+    return signature+")",ret,param_types
+
 def transform_body(src, body, declarations, function_names, shared_names, ret):
     a,_=loc(body,"begin"); z,l=loc(body,"end"); base=a; text=src[a:z+l]; edits=[]
     nodes=list(walk(body))
@@ -269,15 +302,13 @@ def main():
     ns=ap.parse_args(); src=pathlib.Path(ns.input).read_text(); tree=ast(ns.input,ns.clang)
     validate(tree,src,ns.input)
     declarations=Declarations(tree)
-    funcs=[]
+    cuda_decls=[]
     for n in walk(tree):
-        if n.get("kind")!="FunctionDecl" or not child(n,"CompoundStmt"): continue
-        b=child(n,"CompoundStmt"); x,_=loc(b,"begin")
-        if x is not None and x < len(src): funcs.append(n)
-    cuda=[]
-    for f in funcs:
-        attrs={x.get("kind") for x in f.get("inner",[])}
-        if "CUDADeviceAttr" in attrs or "CUDAGlobalAttr" in attrs: cuda.append(f)
+        if (n.get("kind")!="FunctionDecl" or n.get("isImplicit") or
+            not has_cuda_attr(n) or not in_main(n,len(src))): continue
+        x,_=loc(n,"begin")
+        if x is not None and x < len(src): cuda_decls.append(n)
+    cuda=[f for f in cuda_decls if child(f,"CompoundStmt")]
     cuda_by_id={declarations.canonical(f):f for f in cuda}
     # Clang JSON ids model identity but are process-local pointers.  Assign
     # stable translation-unit-local ids in source order for emitted spelling.
@@ -306,7 +337,7 @@ def main():
     kernels=[cuda_by_id[i] for i in ordered if i in kernel_ids]
     shared_types=generated_names("cuda2omp_shared_",(i for i in ordered if i in kernel_ids))
     params_by_kernel={}
-    structs=[]; prototypes=[]; definitions=[]; function_info={}
+    function_info={}
     for ident in ordered:
         f=cuda_by_id[ident]
         body=child(f,"CompoundStmt"); shared=[]
@@ -314,12 +345,8 @@ def main():
             if v.get("kind")=="VarDecl" and v.get("storageClass")=="static" and any(x.get("kind")=="CUDASharedAttr" for x in v.get("inner",[])):
                 shared.append(v)
         shared_fields={declarations.canonical(v):v["name"] for v in shared}
-        ret=f.get("type",{}).get("qualType","void ()").split(" (")[0]
-        params=[]; param_types=[]
-        for p in (x for x in f.get("inner",[]) if x.get("kind")=="ParmVarDecl"):
-            typ=p.get("type",{}).get("qualType","int")
-            params.append(typ+" "+p.get("name","arg")); param_types.append(typ)
         iskernel=ident in kernel_ids
+        signature,ret,param_types=declaration_signature(f,ident,function_names,shared_types,kernel_ids)
         if iskernel: params_by_kernel[ident]=param_types
         st=shared_types.get(ident)
         if iskernel:
@@ -329,21 +356,22 @@ def main():
                 if "[" in typ:
                     base_t,suffix=typ.split("[",1); fields.append(f"  {base_t} {v['name']}[{suffix};")
                 else: fields.append(f"  {typ} {v['name']};")
-            structs.append(f"struct {st} {{\n"+"\n".join(fields)+"\n};")
-        prefix="cuda2omp::Task<"+ret+"> "+function_names[ident]+"(cuda2omp::ThreadContext& ctx"
-        if iskernel: prefix+=f", {st}& shared"
-        if params: prefix+=", "+", ".join(params)
-        signature=prefix+")"
-        prototypes.append(signature+";")
-        function_info[ident]=(signature,body,shared_fields,ret)
-    for ident in ordered:
-        signature,body,shared_fields,ret=function_info[ident]
-        definitions.append(signature+" "+transform_body(
-            src,body,declarations,function_names,shared_fields,ret))
-    # Remove CUDA declarations and transform launch expressions from AST nodes.
+            state=f"struct {st} {{\n"+"\n".join(fields)+"\n};\n"
+        else: state=""
+        function_info[ident]=(signature,body,shared_fields,ret,state)
+    # Rewrite CUDA declarations exactly where they appeared.  Surrounding
+    # namespace and language-linkage declarations therefore remain untouched.
     edits=[]
-    for f in cuda:
-        x,_=loc(f,"begin"); y,tl=loc(f,"end"); edits.append((x,y+tl,""))
+    declared_states=set()
+    for f in cuda_decls:
+        ident=declarations.canonical(f); x,_=loc(f,"begin"); y,tl=loc(f,"end")
+        signature,body,shared_fields,ret,state=function_info[ident]
+        if child(f,"CompoundStmt"):
+            replacement=state+signature+" "+transform_body(src,body,declarations,function_names,shared_fields,ret)
+        else:
+            forward=(f"struct {shared_types[ident]};\n" if ident in kernel_ids and ident not in declared_states else "")
+            replacement=forward+signature+";"; declared_states.add(ident)
+        edits.append((x,y+tl,replacement))
     for n in walk(tree):
         if n.get("kind") not in {"CUDAKernelCallExpr", "CallExpr"}: continue
         launch_api=n.get("kind")=="CallExpr" and refname(n)=="cudaLaunchKernel"
@@ -363,17 +391,23 @@ def main():
             if any(v is not None and v.strip() not in allowed[i] for i,v in enumerate(actual)):
                 raise SystemExit("cuda2omp: dynamic shared memory and streams are unsupported")
             unpack="".join(f", cuda2omp::kernel_arg<{typ}>({argv}, {i})" for i,typ in enumerate(params_by_kernel[kernel_id]))
-            repl=(f"(cuda2omp::launch<{shared_type}>(cuda2omp::extent_x({grid}), cuda2omp::extent_x({block}), "
-                  f"[&](cuda2omp::ThreadContext& ctx, {shared_type}& shared) {{ return {generated_name}(ctx, shared{unpack}); }}), 0)")
+            target=source_text(src,call_parts[1]) or ""
+            qualifier=target.rsplit("::",1)[0]+"::" if "::" in target else ""
+            qname=qualifier+generated_name; qstate=qualifier+shared_type
+            repl=(f"(cuda2omp::launch<{qstate}>(cuda2omp::extent_x({grid}), cuda2omp::extent_x({block}), "
+                  f"[&](cuda2omp::ThreadContext& ctx, {qstate}& shared) {{ return {qname}(ctx, shared{unpack}); }}), 0)")
         else:
             # AST confirms this is a launch; spelling is used only to preserve argument expressions.
             p=raw.find("<<<"); q=raw.find(">>>",p); cfg=raw[p+3:q].split(','); args=raw[raw.find('(',q)+1:raw.rfind(')')]
             if len(cfg)!=2: raise SystemExit("cuda2omp: only <<<grid, block>>> is supported")
+            target=raw[:p].strip(); qualifier=target.rsplit("::",1)[0]+"::" if "::" in target else ""
+            qname=qualifier+generated_name; qstate=qualifier+shared_type
             comma=(", "+args) if args.strip() else ""
-            repl=f"cuda2omp::launch<{shared_type}>({cfg[0]}, {cfg[1]}, [&](cuda2omp::ThreadContext& ctx, {shared_type}& shared) {{ return {generated_name}(ctx, shared{comma}); }})"
+            repl=f"cuda2omp::launch<{qstate}>({cfg[0]}, {cfg[1]}, [&](cuda2omp::ThreadContext& ctx, {qstate}& shared) {{ return {qname}(ctx, shared{comma}); }})"
         edits.append((x,y+tl,repl))
-    host=apply(src,edits)
-    out='#include "cuda2omp_runtime.hpp"\n'+"\n".join(structs+prototypes+definitions)+"\n"+host
+    include_at=runtime_include_offset(src)
+    edits.append((include_at,include_at,'#include "cuda2omp_runtime.hpp"\n'))
+    out=apply(src,edits)
     pathlib.Path(ns.output).write_text(out)
     print("cuda2omp: kernels="+",".join(f['name'] for f in kernels),file=sys.stderr)
     print("cuda2omp: barrier-capable="+",".join(sorted(cuda_by_id[n].get("name","") for n,v in direct.items() if v)),file=sys.stderr)

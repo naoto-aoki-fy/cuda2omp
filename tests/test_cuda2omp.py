@@ -174,4 +174,50 @@ class Tests(unittest.TestCase):
    self.assertIn('cuda2omp_shared_0',transformed)
    self.assertIn('cuda2omp_shared_1',transformed)
 
+ def test_in_place_declarations_and_lexical_contexts_compile(self):
+  self.run_cuda(r'''
+   typedef int Number;
+   __device__ Number later(Number);
+   __device__ Number earlier(Number x) { return later(x)+1; }
+   __device__ Number later(Number x) { return x*2; }
+
+   namespace named {
+   struct Payload { Number value; };
+   __global__ void apply(Payload *p) { p->value=earlier(p->value); }
+   }
+
+   namespace {
+   __device__ Number hidden(Number x);
+   __device__ Number hidden(Number x) { return x+3; }
+   struct Local { Number value; };
+   __global__ void local(Local *p) { p->value=hidden(p->value); }
+   }
+
+   extern "C" {
+   __device__ Number c_helper(Number);
+   __device__ Number c_helper(Number x) { return x+4; }
+   struct CValue { Number value; };
+   __global__ void c_kernel(CValue *p) { p->value=c_helper(p->value); }
+   }
+
+   int main() {
+     named::Payload a{5}; named::apply<<<1,1>>>(&a); if(a.value!=11)return 1;
+     Local b{7}; local<<<1,1>>>(&b); if(b.value!=10)return 2;
+     CValue c{8}; c_kernel<<<1,1>>>(&c); return c.value==12?0:3;
+   }
+  ''')
+
+ def test_runtime_include_and_shared_state_stay_in_place(self):
+  code='''// heading\n#pragma once\n#include <cstddef>\n\nnamespace scope {\nstruct JustBefore { int value; };\n__global__ void kernel(JustBefore *p) { __shared__ int tmp[1]; tmp[0]=p->value; p->value=tmp[0]+1; }\n}\nint main(){scope::JustBefore x{1};scope::kernel<<<1,1>>>(&x);return x.value==2?0:1;}\n'''
+  with tempfile.TemporaryDirectory() as d:
+   d=pathlib.Path(d); cu=d/'in.cu'; cpp=d/'out.cpp'; cu.write_text(code)
+   p=subprocess.run([str(ROOT/'cuda2omp'),str(cu),'-o',str(cpp)],text=True,capture_output=True)
+   self.assertEqual(p.returncode,0,p.stderr)
+   transformed=cpp.read_text()
+   self.assertGreater(transformed.index('#include "cuda2omp_runtime.hpp"'),transformed.index('#include <cstddef>'))
+   self.assertGreater(transformed.index('struct cuda2omp_shared_'),transformed.index('struct JustBefore'))
+   self.assertLess(transformed.index('struct cuda2omp_shared_'),transformed.index('cuda2omp::Task<void>'))
+   p=subprocess.run(['clang++','-std=c++20','-I',str(ROOT/'runtime'),str(cpp),'-o',str(d/'a.out')],text=True,capture_output=True)
+   self.assertEqual(p.returncode,0,p.stderr+'\n'+transformed)
+
 if __name__=='__main__': unittest.main()
