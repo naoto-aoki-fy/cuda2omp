@@ -59,7 +59,9 @@ template<class Shared,class Factory> void launch(unsigned grid,unsigned block,Fa
   #pragma omp parallel for
   for(int b=0;b<(int)grid;++b){Shared shared{};BlockScheduler sched(block);std::vector<std::coroutine_handle<>> roots;roots.reserve(block);
     std::vector<ThreadContext> contexts; contexts.reserve(block);
-    for(unsigned t=0;t<block;++t){contexts.push_back({t,(unsigned)b,block,grid,&sched});auto task=factory(contexts.back(),shared);roots.push_back(task.release());}
-    sched.run(roots);}
+    for(unsigned t=0;t<block;++t){contexts.push_back({t,(unsigned)b,block,grid,&sched});
+      if constexpr(std::is_void_v<decltype(factory(contexts.back(),shared))>) factory(contexts.back(),shared);
+      else {auto task=factory(contexts.back(),shared);roots.push_back(task.release());}}
+    if(!roots.empty()) sched.run(roots);}
 }
 }

@@ -88,6 +88,34 @@ class Declarations:
         declaration=resolved_callee(expression)
         return self.canonical(declaration) if declaration else None
 
+def strongly_connected_components(graph):
+    """Return Tarjan SCCs for a graph keyed by canonical declaration id."""
+    serial=0; stack=[]; active=set(); index={}; low={}; result=[]
+    def visit(node):
+        nonlocal serial
+        index[node]=low[node]=serial; serial+=1
+        stack.append(node); active.add(node)
+        for target in graph[node]:
+            if target not in index:
+                visit(target); low[node]=min(low[node],low[target])
+            elif target in active:
+                low[node]=min(low[node],index[target])
+        if low[node]==index[node]:
+            component=[]
+            while True:
+                target=stack.pop(); active.remove(target); component.append(target)
+                if target==node: break
+            result.append(component)
+    for node in graph:
+        if node not in index: visit(node)
+    return result
+
+def device_call_graph(functions, declarations):
+    """Construct direct edges using resolved, canonical declaration identity."""
+    return {ident:{declarations.referenced(call) for call in walk(child(f,"CompoundStmt"))
+                   if call.get("kind")=="CallExpr"} & set(functions)
+            for ident,f in functions.items()}
+
 # These sets are deliberately explicit.  Adding syntax to the lowerer requires
 # adding it here too, so an unfamiliar CUDA AST node can never silently leak
 # into the generated host program.
@@ -209,16 +237,10 @@ def validate(tree, src, filename):
             if kind in {"MemberExpr","CallExpr","VarDecl"}:
                 if macro_range(n):
                     complain(n,"macro range cannot be rewritten")
-    visiting=set(); done=set()
-    def dfs(ident):
-        if ident in visiting: return True
-        if ident in done: return False
-        visiting.add(ident)
-        recursive=any(dfs(c) for c in edges[ident])
-        visiting.remove(ident); done.add(ident)
-        return recursive
-    for ident in functions:
-        if dfs(ident): complain(functions[ident],f"recursive CUDA call involving '{functions[ident].get('name')}' is unsupported")
+    for component in strongly_connected_components(edges):
+        if len(component)>1 or component[0] in edges[component[0]]:
+            names=", ".join(sorted(functions[n].get("name","") for n in component))
+            complain(functions[component[0]],f"recursive CUDA call component ({names}) is unsupported")
     for n in nodes:
         if not in_main(n,size): continue
         if n.get("kind")=="CUDAKernelCallExpr":
@@ -379,19 +401,21 @@ def runtime_include_offset(src):
         else: break
     return offset
 
-def declaration_signature(f, ident, function_names, shared_types, kernel_ids):
+def declaration_signature(f, ident, function_names, shared_types, kernel_ids, coroutine_ids):
     """Create the common declaration/definition signature for a CUDA function."""
     ret=f.get("type",{}).get("qualType","void ()").split(" (")[0]
     params=[]; param_types=[]
     for index,p in enumerate(x for x in f.get("inner",[]) if x.get("kind")=="ParmVarDecl"):
         typ=p.get("type",{}).get("qualType","int")
         params.append(typ+" "+(p.get("name") or f"cuda2omp_arg_{index}")); param_types.append(typ)
-    signature="cuda2omp::Task<"+ret+"> "+function_names[ident]+"(cuda2omp::ThreadContext& ctx"
+    result=("cuda2omp::Task<"+ret+">" if ident in coroutine_ids else ret)
+    signature=result+" "+function_names[ident]+"(cuda2omp::ThreadContext& ctx"
     if ident in kernel_ids: signature+=f", {shared_types[ident]}& shared"
     if params: signature+=", "+", ".join(params)
     return signature+")",ret,param_types
 
-def transform_body(src, body, declarations, function_names, shared_names, ret):
+def transform_body(src, body, declarations, function_names, shared_names, ret,
+                   coroutine_ids, is_coroutine):
     a,_=loc(body,"begin"); z,l=loc(body,"end"); base=a; text=src[a:z+l]; edits=[]
     nodes=list(walk(body))
     # Semantic references to CUDA builtins and block shared declarations.
@@ -412,7 +436,7 @@ def transform_body(src, body, declarations, function_names, shared_names, ret):
         if name=="__syncthreads":
             y,tl=loc(n,"end"); edits.append((x-base,y+tl-base,"co_await ctx.syncthreads()"))
         elif callee_id in function_names:
-            edits.append((x-base,x-base,"co_await "))
+            if callee_id in coroutine_ids: edits.append((x-base,x-base,"co_await "))
             dr=next((q for q in walk(n.get("inner",[])[0]) if q.get("kind")=="DeclRefExpr" and declarations.canonical(q.get("referencedDecl"))==callee_id),None)
             if dr:
                 dx,_=loc(dr,"begin"); dy,dt=loc(dr,"end"); edits.append((dx-base,dy+dt-base,function_names[callee_id]))
@@ -423,10 +447,11 @@ def transform_body(src, body, declarations, function_names, shared_names, ret):
     for v in (n for n in nodes if n.get("kind")=="VarDecl" and declarations.canonical(n) in shared_names):
         x,_=loc(v,"begin"); y,tl=loc(v,"end"); semi=src.find(';',y+tl,y+tl+3)
         edits.append((x-base,semi+1-base,""))
-    for q in walk(body):
-        if q.get("kind")=="ReturnStmt":
-            x,_=loc(q,"begin"); edits.append((x-base,x-base+6,"co_return"))
-    if ret=="void": edits.append((z-base,z-base," co_return;"))
+    if is_coroutine:
+        for q in walk(body):
+            if q.get("kind")=="ReturnStmt":
+                x,_=loc(q,"begin"); edits.append((x-base,x-base+6,"co_return"))
+        if ret=="void": edits.append((z-base,z-base," co_return;"))
     return apply(text,edits)
 
 def main():
@@ -478,14 +503,19 @@ def main():
     direct={ident:any((resolved_callee(x) or {}).get("name")=="__syncthreads"
                       for x in walk(child(f,"CompoundStmt")) if x.get("kind")=="CallExpr")
             for ident,f in cuda_by_id.items()}
-    calls={ident:{declarations.referenced(x) for x in walk(child(f,"CompoundStmt"))
-                  if x.get("kind")=="CallExpr"} & set(cuda_by_id)
-           for ident,f in cuda_by_id.items()}
+    calls=device_call_graph(cuda_by_id,declarations)
+    components=strongly_connected_components(calls)
+    component_of={node:i for i,component in enumerate(components) for node in component}
+    component_edges={i:{component_of[target] for node in component for target in calls[node]
+                        if component_of[target]!=i} for i,component in enumerate(components)}
+    required={i for i,component in enumerate(components) if any(direct[node] for node in component)}
     changed=True
     while changed:
         changed=False
-        for n in cuda_by_id:
-            if not direct[n] and any(direct[c] for c in calls[n]): direct[n]=True; changed=True
+        for component,targets in component_edges.items():
+            if component not in required and targets & required:
+                required.add(component); changed=True
+    coroutine_ids={node for node in cuda_by_id if component_of[node] in required}
     kernel_ids={declarations.canonical(f) for f in cuda if any(x.get("kind")=="CUDAGlobalAttr" for x in f.get("inner",[]))}
     kernels=[cuda_by_id[i] for i in ordered if i in kernel_ids]
     shared_types=generated_names("cuda2omp_shared_",(i for i in ordered if i in kernel_ids))
@@ -499,7 +529,7 @@ def main():
                 shared.append(v)
         shared_fields={declarations.canonical(v):v["name"] for v in shared}
         iskernel=ident in kernel_ids
-        signature,ret,param_types=declaration_signature(f,ident,function_names,shared_types,kernel_ids)
+        signature,ret,param_types=declaration_signature(f,ident,function_names,shared_types,kernel_ids,coroutine_ids)
         if iskernel: params_by_kernel[ident]=param_types
         st=shared_types.get(ident)
         if iskernel:
@@ -520,7 +550,9 @@ def main():
         ident=declarations.canonical(f); x,_=loc(f,"begin"); y,tl=loc(f,"end")
         signature,body,shared_fields,ret,state=function_info[ident]
         if child(f,"CompoundStmt"):
-            replacement=state+signature+" "+transform_body(src,body,declarations,function_names,shared_fields,ret)
+            replacement=state+signature+" "+transform_body(
+                src,body,declarations,function_names,shared_fields,ret,
+                coroutine_ids,ident in coroutine_ids)
         else:
             forward=(f"struct {shared_types[ident]};\n" if ident in kernel_ids and ident not in declared_states else "")
             replacement=forward+signature+";"; declared_states.add(ident)
@@ -563,5 +595,5 @@ def main():
     out=apply(src,edits)
     pathlib.Path(ns.output).write_text(out)
     print("cuda2omp: kernels="+",".join(f['name'] for f in kernels),file=sys.stderr)
-    print("cuda2omp: barrier-capable="+",".join(sorted(cuda_by_id[n].get("name","") for n,v in direct.items() if v)),file=sys.stderr)
+    print("cuda2omp: barrier-capable="+",".join(sorted(cuda_by_id[n].get("name","") for n in coroutine_ids)),file=sys.stderr)
 if __name__=="__main__": main()

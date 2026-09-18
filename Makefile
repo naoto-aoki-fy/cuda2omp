@@ -12,7 +12,7 @@ PUBLIC_HEADERS := runtime/cuda2omp_runtime.hpp runtime/cuda_runtime.h
 COMPATIBILITY_HEADERS := $(wildcard runtime/*_shim.hpp)
 HAVE_LLVM_CONFIG := $(shell command -v "$(LLVM_CONFIG)" >/dev/null 2>&1 && echo yes)
 
-.PHONY: all native test check installcheck install clean
+.PHONY: all native test check benchmark installcheck install clean
 
 all: native
 
@@ -33,6 +33,9 @@ endif
 
 test check:
 	$(PYTHON) tests/test_cuda2omp.py
+
+benchmark:
+	$(PYTHON) benchmarks/barrier_free_launch.py
 
 # Kept as a named packaging check so distributors can exercise the installed
 # layout independently of the rest of the source-tree test suite.

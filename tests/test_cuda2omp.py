@@ -227,6 +227,7 @@ class Tests(unittest.TestCase):
    'template': ('template<class T> __device__ T f(T x){return x;} __global__ void k(){}', 'templates are unsupported'),
    'indirect call': ('__device__ int f(int x){return x;} __global__ void k(){int(*p)(int)=f; p(1);}', 'indirect calls'),
    'recursion': ('__device__ int f(int x){return x?f(x-1):0;} __global__ void k(){f(1);}', 'recursive CUDA call'),
+   'mutual recursion': ('__device__ int b(int); __device__ int a(int x){return b(x);} __device__ int b(int x){return a(x);} __global__ void k(){a(1);}', 'recursive CUDA call component'),
    'macro range': ('#define TID threadIdx.x\n__global__ void k(){int x=TID;}', 'macro range'),
    'dynamic shared': ('__global__ void k(){extern __shared__ int x[];}', 'fixed-size kernel-local'),
    'stream': ('__global__ void k(){} int main(){k<<<1,1,0,(void*)1>>>();}', 'only <<<grid, block>>>'),
@@ -282,6 +283,40 @@ class Tests(unittest.TestCase):
      if(status != 0) return 1;
      for(int v:x) if(v != 42) return 2;
    }
+  ''')
+
+ def test_call_graph_selects_only_barrier_reaching_coroutines(self):
+  code=r'''
+   __device__ int leaf(int x) { return x+1; }
+   __device__ int middle(int x) { return leaf(x)*2; }
+   __device__ int barrier_leaf(int *p, int x) { p[threadIdx.x]=x; __syncthreads(); return p[threadIdx.x]; }
+   __device__ int barrier_parent(int *p, int x) { return barrier_leaf(p,x)+1; }
+   __device__ int choose(int *p, int x) { return barrier_parent(p,x)+(x ? middle(x) : 0); }
+   __global__ void plain(int *p) { p[threadIdx.x]=middle(p[threadIdx.x]); }
+   __global__ void mixed(int *p) { __shared__ int tmp[2]; p[threadIdx.x]=choose(tmp,p[threadIdx.x]); }
+   int main(){int a[2]={2,3};plain<<<1,2>>>(a);if(a[0]!=6||a[1]!=8)return 1;
+     int b[2]={0,2};mixed<<<1,2>>>(b);return b[0]==1&&b[1]==9?0:2;}
+  '''
+  with tempfile.TemporaryDirectory() as d:
+   d=pathlib.Path(d); cu=d/'in.cu'; cpp=d/'out.cpp'; cu.write_text(textwrap.dedent(code))
+   translated=subprocess.run([str(ROOT/'cuda2omp'),str(cu),'-o',str(cpp)],text=True,capture_output=True)
+   self.assertEqual(translated.returncode,0,translated.stderr)
+   output=cpp.read_text()
+   self.assertEqual(output.count('cuda2omp::Task<'),4)
+   self.assertIn('int cuda2omp_fn_0(',output); self.assertIn('int cuda2omp_fn_1(',output)
+   self.assertNotIn('co_await cuda2omp_fn_1',output)
+   self.assertIn('co_await cuda2omp_fn_2',output)
+  self.run_cuda(code)
+
+ def test_forward_declarations_preserve_coroutine_classification_and_returns(self):
+  self.run_cuda(r'''
+   __device__ int plain(int);
+   __device__ int waiting(int *, int);
+   __device__ int caller(int *p, int x) { return plain(x)+waiting(p,x); }
+   __device__ int plain(int x) { return x*3; }
+   __device__ int waiting(int *p, int x) { p[threadIdx.x]=x; __syncthreads(); return p[threadIdx.x]+4; }
+   __global__ void kernel(int *p) { __shared__ int tmp[2]; p[threadIdx.x]=caller(tmp,p[threadIdx.x]); }
+   int main(){int x[2]={2,3};kernel<<<1,2>>>(x);return x[0]==12&&x[1]==16?0:1;}
   ''')
 
  def test_canonical_declarations_disambiguate_names_and_overloads(self):
@@ -371,7 +406,7 @@ class Tests(unittest.TestCase):
    transformed=cpp.read_text()
    self.assertGreater(transformed.index('#include "cuda2omp_runtime.hpp"'),transformed.index('#include <cstddef>'))
    self.assertGreater(transformed.index('struct cuda2omp_shared_'),transformed.index('struct JustBefore'))
-   self.assertLess(transformed.index('struct cuda2omp_shared_'),transformed.index('cuda2omp::Task<void>'))
+   self.assertLess(transformed.index('struct cuda2omp_shared_'),transformed.index('void cuda2omp_fn_'))
    p=subprocess.run(['clang++','-std=c++20','-I',str(ROOT/'runtime'),str(cpp),'-o',str(d/'a.out')],text=True,capture_output=True)
    self.assertEqual(p.returncode,0,p.stderr+'\n'+transformed)
 
