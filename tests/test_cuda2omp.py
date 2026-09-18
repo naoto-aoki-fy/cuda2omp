@@ -70,7 +70,6 @@ class Tests(unittest.TestCase):
   cases={
    'builtin member': ('__global__ void k(){int i=threadIdx.y;} int main(){k<<<1,1>>>();}', 'only .x'),
    'template': ('template<class T> __device__ T f(T x){return x;} __global__ void k(){}', 'templates are unsupported'),
-   'overload': ('__device__ int f(int x){return x;} __device__ int f(long x){return x;} __global__ void k(){}', 'overloaded CUDA function'),
    'indirect call': ('__device__ int f(int x){return x;} __global__ void k(){int(*p)(int)=f; p(1);}', 'indirect calls'),
    'recursion': ('__device__ int f(int x){return x?f(x-1):0;} __global__ void k(){f(1);}', 'recursive CUDA call'),
    'macro range': ('#define TID threadIdx.x\n__global__ void k(){int x=TID;}', 'macro range'),
@@ -129,5 +128,50 @@ class Tests(unittest.TestCase):
      for(int v:x) if(v != 42) return 2;
    }
   ''')
+
+ def test_canonical_declarations_disambiguate_names_and_overloads(self):
+  self.run_cuda(r'''
+   int adjust(double x) { return int(x)+100; }
+   namespace left {
+   __device__ int adjust(int x) { return x+1; }
+   __global__ void same(int *x) { __shared__ int tmp[2];
+     int t=threadIdx.x; tmp[t]=adjust(x[t]); __syncthreads();
+     { int tmp=40; if(t==0) x[2]=tmp; }
+     x[t]=tmp[1-t]; }
+   }
+   namespace right {
+   __device__ long adjust(long x) { return x+10; }
+   __global__ void same(long *x) { __shared__ long tmp[2];
+     int t=threadIdx.x; tmp[t]=adjust(x[t]); __syncthreads(); x[t]=tmp[1-t]; }
+   }
+   int main() {
+     int a[3]={1,2,0}; long b[2]={3,4};
+     left::same<<<1,2>>>(a); right::same<<<1,2>>>(b);
+     if(a[0]!=3 || a[1]!=2 || a[2]!=40) return 1;
+     if(b[0]!=14 || b[1]!=13) return 2;
+     if(adjust(1.0)!=101) return 3;
+   }
+  ''')
+
+ def test_generated_identifiers_are_stable_and_collision_free(self):
+  code=r'''
+   int cuda2omp_fn_0 = 7;
+   namespace a { __global__ void kernel(int *x) { x[0]=1; } }
+   namespace b { __global__ void kernel(int *x) { x[0]=2; } }
+   int main(){ int x=0; a::kernel<<<1,1>>>(&x); if(x!=1)return 1;
+     b::kernel<<<1,1>>>(&x); return x==2?0:2; }
+  '''
+  with tempfile.TemporaryDirectory() as d:
+   d=pathlib.Path(d); source=d/'in.cu'; first=d/'one.cpp'; second=d/'two.cpp'
+   source.write_text(textwrap.dedent(code))
+   for output in (first,second):
+    p=subprocess.run([str(ROOT/'cuda2omp'),str(source),'-o',str(output)],text=True,capture_output=True)
+    self.assertEqual(p.returncode,0,p.stderr)
+   self.assertEqual(first.read_text(),second.read_text())
+   transformed=first.read_text()
+   self.assertIn('cuda2omp_fn_1',transformed)
+   self.assertIn('cuda2omp_fn_2',transformed)
+   self.assertIn('cuda2omp_shared_0',transformed)
+   self.assertIn('cuda2omp_shared_1',transformed)
 
 if __name__=='__main__': unittest.main()
