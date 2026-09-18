@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json, os, pathlib, shlex, subprocess, tempfile, textwrap, unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
+CXX=os.environ.get('CXX','clang++')
 
 class Tests(unittest.TestCase):
  def test_staged_install_is_self_contained(self):
@@ -24,7 +25,7 @@ class Tests(unittest.TestCase):
    self.assertEqual(translated.returncode,0,translated.stderr)
    self.assertNotIn(str(ROOT),translated.stderr)
    self.assertNotIn(str(ROOT),output.read_text())
-   compiled=subprocess.run(['clang++','-std=c++20','-I',str(stage/'usr/include'),
+   compiled=subprocess.run([CXX,'-std=c++20','-I',str(stage/'usr/include'),
                             str(output),'-o',str(executable)],cwd=work,
                            text=True,capture_output=True)
    self.assertEqual(compiled.returncode,0,compiled.stderr)
@@ -70,7 +71,7 @@ class Tests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as temporary:
    directory=pathlib.Path(temporary); source=directory/'api.cpp'; program=directory/'api'
    source.write_text(textwrap.dedent(code))
-   compiled=subprocess.run(['clang++','-std=c++20','-pthread','-I',str(ROOT/'runtime'),
+   compiled=subprocess.run([CXX,'-std=c++20','-pthread','-I',str(ROOT/'runtime'),
                             str(source),'-o',str(program)],text=True,capture_output=True)
    self.assertEqual(compiled.returncode,0,compiled.stderr)
    run=subprocess.run([str(program)],text=True,capture_output=True)
@@ -94,7 +95,7 @@ class Tests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as temporary:
    directory=pathlib.Path(temporary); source=directory/'negative.cpp'; program=directory/'negative'
    source.write_text(textwrap.dedent(code))
-   compiled=subprocess.run(['clang++','-std=c++20','-I',str(ROOT/'runtime'),str(source),
+   compiled=subprocess.run([CXX,'-std=c++20','-I',str(ROOT/'runtime'),str(source),
                             '-o',str(program)],text=True,capture_output=True)
    self.assertEqual(compiled.returncode,0,compiled.stderr)
    run=subprocess.run([str(program)],text=True,capture_output=True)
@@ -127,7 +128,7 @@ class Tests(unittest.TestCase):
    response.write_text(shlex.join(['-I../relative includes','-Igenerated headers','-DVALUE=7',
                                    '-std=c++17','-MF','discard.d','-c']))
    entry={'directory':str(build),'file':'../source/kernel file.cu',
-          'arguments':['clang++','@flags.rsp','../source/kernel file.cu','-o','old output.o']}
+          'arguments':[CXX,'@flags.rsp','../source/kernel file.cu','-o','old output.o']}
    (build/'compile_commands.json').write_text(json.dumps([entry]))
    output=root/'result file.cpp'
    command=[str(ROOT/'cuda2omp'),'-p',str(build),'-v',str(source),'-o',str(output),
@@ -150,7 +151,7 @@ class Tests(unittest.TestCase):
    root=pathlib.Path(temporary); source=root/'input.cu'; source.write_text('int main(){}\n')
    database=root/'compile_commands.json'
    for entries,message in (([], 'no compile_commands.json entry'),
-                           ([{'directory':str(root),'file':'input.cu','arguments':['clang++','input.cu']}]*2,
+                           ([{'directory':str(root),'file':'input.cu','arguments':[CXX,'input.cu']}]*2,
                             'ambiguous compile_commands.json entries')):
     database.write_text(json.dumps(entries))
     result=subprocess.run([str(ROOT/'cuda2omp'),'-p',str(root),str(source),'-o',str(root/'out.cpp')],
@@ -204,9 +205,8 @@ class Tests(unittest.TestCase):
    d=pathlib.Path(d); cu=d/'in.cu'; cpp=d/'out.cpp'; exe=d/'a.out'; cu.write_text(textwrap.dedent(code))
    p=subprocess.run([str(ROOT/'cuda2omp'),str(cu),'-o',str(cpp)],text=True,capture_output=True)
    self.assertEqual(p.returncode,0,p.stderr)
-   p=subprocess.run(['clang++','-std=c++20','-fopenmp','-I',str(ROOT/'runtime'),str(cpp),'-o',str(exe)],text=True,capture_output=True)
-   if p.returncode: # Swift clang commonly has no OpenMP runtime; pragmas remain valid without it.
-    p=subprocess.run(['clang++','-std=c++20','-I',str(ROOT/'runtime'),str(cpp),'-o',str(exe)],text=True,capture_output=True)
+   flags=shlex.split(os.environ.get('CUDA2OMP_OPENMP_FLAGS','-fopenmp'))
+   p=subprocess.run([CXX,'-std=c++20',*flags,'-I',str(ROOT/'runtime'),str(cpp),'-o',str(exe)],text=True,capture_output=True)
    self.assertEqual(p.returncode,0,p.stderr+'\n'+cpp.read_text())
    p=subprocess.run([str(exe)],text=True,capture_output=True)
    self.assertEqual(p.returncode,0,p.stdout+p.stderr)
@@ -232,6 +232,8 @@ class Tests(unittest.TestCase):
    'dynamic shared': ('__global__ void k(){extern __shared__ int x[];}', 'fixed-size kernel-local'),
    'stream': ('__global__ void k(){} int main(){k<<<1,1,0,(void*)1>>>();}', 'only <<<grid, block>>>'),
    'device variable': ('__device__ int value; __global__ void k(){}', 'device/global CUDA variables'),
+   'constant attribute': ('int value __attribute__((constant)); __global__ void k(){}', 'device/global CUDA variables'),
+   'unsupported CUDA API': ('__device__ int atomicAdd(int*,int); __global__ void k(int*p){atomicAdd(p,1);}', 'CUDA function declaration has no supported definition'),
    'shared in device': ('__device__ void f(){__shared__ int x[2];} __global__ void k(){f();}', 'directly kernel-local'),
    'shared scalar': ('__global__ void k(){__shared__ int x;}', 'fixed-size kernel-local'),
    'unsupported expression': ('__global__ void k(int x){switch(x){case 1: break;}}', 'unsupported CUDA expression SwitchStmt'),
@@ -407,7 +409,51 @@ class Tests(unittest.TestCase):
    self.assertGreater(transformed.index('#include "cuda2omp_runtime.hpp"'),transformed.index('#include <cstddef>'))
    self.assertGreater(transformed.index('struct cuda2omp_shared_'),transformed.index('struct JustBefore'))
    self.assertLess(transformed.index('struct cuda2omp_shared_'),transformed.index('void cuda2omp_fn_'))
-   p=subprocess.run(['clang++','-std=c++20','-I',str(ROOT/'runtime'),str(cpp),'-o',str(d/'a.out')],text=True,capture_output=True)
+   p=subprocess.run([CXX,'-std=c++20','-I',str(ROOT/'runtime'),str(cpp),'-o',str(d/'a.out')],text=True,capture_output=True)
    self.assertEqual(p.returncode,0,p.stderr+'\n'+transformed)
 
-if __name__=='__main__': unittest.main()
+ def test_lexical_context_and_utf8_before_kernel(self):
+  code=r'''// __global__ fake<<<1,1>>> café 🚀
+   const char *text="__device__ threadIdx.x <<<not a launch>>>";
+   #define ORDINARY_MACRO(x) ((x)+1)
+   __global__ void real(int *p) { p[threadIdx.x]=p[threadIdx.x]+1; }
+   int main(){int p[2]={4,8};int unused=ORDINARY_MACRO(0);real<<<1,2>>>(p);return unused==1&&p[0]==5&&p[1]==9?0:1;}
+  '''
+  self.run_cuda(code)
+
+ def test_complex_launch_expressions(self):
+  self.run_cuda(r'''
+   int grid_size(){return 2;} int block_size(){return 3;}
+   __global__ void mark(int *p){p[blockIdx.x*blockDim.x+threadIdx.x]=7;}
+   int main(){int p[6]={};mark<<<(grid_size()), (block_size())>>>(p);
+    for(int x:p)if(x!=7)return 1;}
+  ''')
+
+ def test_macro_launch_rejection_preserves_output(self):
+  self.assert_rejected(r'''
+   __global__ void k(){}
+   #define LAUNCH k<<<1,1>>>()
+   int main(){LAUNCH;}
+  ''', 'macro range')
+
+ def test_invalid_barrier_reports_runtime_diagnostic(self):
+  code=r'''
+   __global__ void invalid(){if(threadIdx.x) __syncthreads();}
+   int main(){invalid<<<1,2>>>();}
+  '''
+  with tempfile.TemporaryDirectory() as temporary:
+   d=pathlib.Path(temporary); source=d/'in.cu'; output=d/'out.cpp'; program=d/'program'
+   source.write_text(textwrap.dedent(code))
+   translated=subprocess.run([str(ROOT/'cuda2omp'),str(source),'-o',str(output)],text=True,capture_output=True)
+   self.assertEqual(translated.returncode,0,translated.stderr)
+   flags=shlex.split(os.environ.get('CUDA2OMP_OPENMP_FLAGS','-fopenmp'))
+   compiled=subprocess.run([CXX,'-std=c++20',*flags,'-I',str(ROOT/'runtime'),str(output),'-o',str(program)],text=True,capture_output=True)
+   self.assertEqual(compiled.returncode,0,compiled.stderr)
+   run=subprocess.run([str(program)],text=True,capture_output=True)
+   self.assertNotEqual(run.returncode,0)
+   self.assertIn('cuda2omp: divergent barrier (1/2)',run.stderr)
+
+def run_named(names):
+ suite=unittest.TestSuite(Tests(name) for name in names)
+ result=unittest.TextTestRunner(verbosity=2).run(suite)
+ raise SystemExit(not result.wasSuccessful())

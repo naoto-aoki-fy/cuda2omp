@@ -41,6 +41,30 @@ def loc(n, which):
     x = x.get("expansionLoc", x)
     return x.get("offset"), x.get("tokLen", 1)
 
+def normalize_ast_offsets(tree, source):
+    """Convert Clang's UTF-8 byte offsets to Python character offsets."""
+    encoded=source.encode("utf-8")
+    byte_to_char=[0]*(len(encoded)+1)
+    byte_index=0
+    for char_index, character in enumerate(source):
+        width=len(character.encode("utf-8"))
+        for position in range(byte_index,byte_index+width): byte_to_char[position]=char_index
+        byte_index+=width
+        byte_to_char[byte_index]=char_index+1
+    def visit(value):
+        if isinstance(value,dict):
+            if isinstance(value.get("offset"),int):
+                start=value["offset"]
+                if 0 <= start <= len(encoded):
+                    length=value.get("tokLen")
+                    value["offset"]=byte_to_char[start]
+                    if isinstance(length,int) and start+length <= len(encoded):
+                        value["tokLen"]=byte_to_char[start+length]-byte_to_char[start]
+            for child_value in value.values(): visit(child_value)
+        elif isinstance(value,list):
+            for child_value in value: visit(child_value)
+    visit(tree)
+
 def walk(n):
     yield n
     for c in n.get("inner", []): yield from walk(c)
@@ -477,6 +501,7 @@ def main():
     trailing=_expand_response_files(trailing,directory)
     src=input_path.read_text()
     tree=ast(input_path,ns.clang,shim,database_arguments,trailing,directory,ns.verbose)
+    normalize_ast_offsets(tree,src)
     ns.input=str(input_path)
     validate(tree,src,ns.input)
     declarations=Declarations(tree)

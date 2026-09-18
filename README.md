@@ -147,3 +147,26 @@ once per phase by every logical thread; otherwise the runtime emits a divergent
 barrier diagnostic and aborts. This is a source prototype rather than a complete
 Clang plugin: semantic selection comes from the CUDA AST, while source ranges
 preserve user expressions in generated C++.
+
+## Test suites
+
+The Makefile keeps failure modes independently selectable:
+
+* `make test-translation` checks frontend diagnostics, source locations, headers,
+  macros, unsupported CUDA constructs, nonzero status, and output-file atomicity.
+* `make test-compilation` translates positive cases and compiles the generated
+  C++ (including namespaces, overload resolution, shadowing, UTF-8, lexical
+  contexts, and nontrivial launch expressions).
+* `make test-runtime` executes CPU runtime and translated-kernel semantics,
+  including valid barriers and the diagnostic for a divergent barrier.
+* `make installcheck` stages `make install` into a temporary root and uses only
+  the installed driver, private resource, and public headers.
+* `make test-cuda-differential` is optional. It reports a unittest skip unless
+  `CUDA2OMP_CUDA_RUNNER=1`, `nvcc`, and a functioning GPU runner are available.
+
+`make test-openmp` is the required OpenMP path and never retries compilation
+without `-fopenmp`. `make test-serial` is the explicitly named fallback: it
+asserts that generated OpenMP pragmas may be ignored while the coroutine
+scheduler continues to provide logical CUDA-thread and barrier semantics.
+`make test-sanitize` adds AddressSanitizer and UndefinedBehaviorSanitizer to the
+OpenMP generated-code and runtime suites.

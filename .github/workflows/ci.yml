@@ -1,0 +1,43 @@
+name: tests
+on: [push, pull_request]
+
+jobs:
+  openmp:
+    name: OpenMP (Clang 18 + libomp 18)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 libomp-18-dev
+      - run: make test-openmp CXX=clang++-18 CLANG=clang++-18
+
+  generated-cxx-sanitizers:
+    name: Generated C++ (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 libomp-18-dev
+      - run: make test-sanitize CXX=clang++-18 CLANG=clang++-18
+
+  staged-install:
+    name: Staged make install
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-18
+      - run: make installcheck CXX=clang++-18 CLANG=clang++-18
+
+  serial-fallback:
+    name: Explicit serial fallback (no OpenMP linkage)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-18
+      - run: make test-serial CXX=clang++-18 CLANG=clang++-18
+
+  cuda-differential:
+    name: Optional CUDA differential
+    if: ${{ vars.CUDA_RUNNER == 'available' }}
+    runs-on: [self-hosted, linux, x64, cuda]
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test-cuda-differential CUDA2OMP_CUDA_RUNNER=1

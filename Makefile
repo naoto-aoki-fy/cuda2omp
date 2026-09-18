@@ -12,7 +12,7 @@ PUBLIC_HEADERS := runtime/cuda2omp_runtime.hpp runtime/cuda_runtime.h
 COMPATIBILITY_HEADERS := $(wildcard runtime/*_shim.hpp)
 HAVE_LLVM_CONFIG := $(shell command -v "$(LLVM_CONFIG)" >/dev/null 2>&1 && echo yes)
 
-.PHONY: all native test check benchmark installcheck install clean
+.PHONY: all native test check test-translation test-compilation test-runtime test-openmp test-serial test-sanitize test-cuda-differential benchmark installcheck install clean
 
 all: native
 
@@ -31,8 +31,31 @@ native:
 	@echo "cuda2omp: $(LLVM_CONFIG) not found; skipping optional native frontend"
 endif
 
-test check:
-	$(PYTHON) tests/test_cuda2omp.py
+test check: test-translation test-compilation test-runtime
+
+test-translation:
+	$(PYTHON) tests/test_translation_diagnostics.py
+
+test-compilation:
+	$(PYTHON) tests/test_generated_compilation.py
+
+test-runtime:
+	$(PYTHON) tests/test_runtime_semantics.py
+
+# The required path: compilation must genuinely enable OpenMP and never retries
+# without it. CI pins CXX/CLANG to an OpenMP-capable toolchain.
+test-openmp: test
+
+# Explicit fallback contract: generated pragmas may be ignored, while logical
+# CUDA threads and barriers remain implemented by the coroutine scheduler.
+test-serial:
+	CUDA2OMP_OPENMP_FLAGS= $(MAKE) test
+
+test-sanitize:
+	CUDA2OMP_OPENMP_FLAGS="-fopenmp -fsanitize=address,undefined -fno-omit-frame-pointer" $(MAKE) test-compilation test-runtime
+
+test-cuda-differential:
+	$(PYTHON) tests/test_cuda_differential.py
 
 benchmark:
 	$(PYTHON) benchmarks/barrier_free_launch.py
@@ -40,7 +63,7 @@ benchmark:
 # Kept as a named packaging check so distributors can exercise the installed
 # layout independently of the rest of the source-tree test suite.
 installcheck:
-	$(PYTHON) tests/test_cuda2omp.py Tests.test_staged_install_is_self_contained
+	$(PYTHON) tests/test_installation.py
 
 install:
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(INCLUDEDIR)" \
