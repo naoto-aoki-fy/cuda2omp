@@ -9,6 +9,7 @@ then emits inspectable C++20 coroutine source.  No CUDA SDK or GPU is needed.
 ```sh
 make
 make test
+make installcheck
 ./cuda2omp examples/reverse.cu -o reverse.cpp
 clang++ -std=c++20 -fopenmp -Iruntime reverse.cpp -o reverse
 ./reverse
@@ -38,6 +39,9 @@ overrides that lookup; `CUDA2OMP_RESOURCE_DIR` provides the same override when
 the option is absent. The driver checks for `cuda_frontend_shim.hpp` before
 starting Clang and reports the searched directory and both override mechanisms
 if the installation is incomplete. Source-tree runs fall back to `runtime/`.
+`make installcheck` creates a temporary `DESTDIR`, invokes that installed
+driver, and compiles its translation using only the staged public include
+directory.
 
 ## Native parsing and rewrite layer
 

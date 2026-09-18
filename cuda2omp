@@ -6,15 +6,16 @@ ROOT = pathlib.Path(__file__).resolve().parent
 
 def resource_directory(override=None):
     """Locate compiler-private headers, preferring explicit configuration."""
-    configured=override or os.environ.get("CUDA2OMP_RESOURCE_DIR")
-    if configured:
+    configured=override if override is not None else os.environ.get("CUDA2OMP_RESOURCE_DIR")
+    if configured is not None:
         return pathlib.Path(configured).expanduser().resolve()
     # Installed executables live in PREFIX/bin and resources in
     # PREFIX/lib/cuda2omp.  The source-tree fallback keeps development runs
     # useful without baking the checkout or DESTDIR into installed scripts.
-    installed=(ROOT.parent/"lib"/"cuda2omp").resolve()
     source_resources=ROOT/"runtime"
-    return source_resources if (source_resources/"cuda_frontend_shim.hpp").is_file() else installed
+    if (ROOT/"Makefile").is_file() and (source_resources/"cuda_frontend_shim.hpp").is_file():
+        return source_resources
+    return (ROOT.parent/"lib"/"cuda2omp").resolve()
 
 def frontend_shim(directory):
     shim=directory/"cuda_frontend_shim.hpp"

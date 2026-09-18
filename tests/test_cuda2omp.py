@@ -17,9 +17,11 @@ class Tests(unittest.TestCase):
    source=work/'input.cu'; output=work/'output.cpp'; executable=work/'program'
    source.write_text('__global__ void set(int*x){x[threadIdx.x]=7;} '
                      'int main(){int x[1]={};set<<<1,1>>>(x);return x[0]!=7;}\n')
-   translated=subprocess.run([str(driver),str(source),'-o',str(output)],cwd=work,
+   translated=subprocess.run([str(driver),'-v',str(source),'-o',str(output)],cwd=work,
                              text=True,capture_output=True)
    self.assertEqual(translated.returncode,0,translated.stderr)
+   self.assertNotIn(str(ROOT),translated.stderr)
+   self.assertNotIn(str(ROOT),output.read_text())
    compiled=subprocess.run(['clang++','-std=c++20','-I',str(stage/'usr/include'),
                             str(output),'-o',str(executable)],cwd=work,
                            text=True,capture_output=True)
@@ -32,6 +34,11 @@ class Tests(unittest.TestCase):
    self.assertNotEqual(missing.returncode,0)
    self.assertIn("required frontend resource 'cuda_frontend_shim.hpp' not found",missing.stderr)
    self.assertIn(str(work/'missing'),missing.stderr)
+   # An explicit option has priority over the environment override.
+   explicit=subprocess.run([str(driver),'--resource-dir',str(stage/'usr/lib/cuda2omp'),
+                            str(source),'-o',str(output)],cwd=work,env=env,
+                           text=True,capture_output=True)
+   self.assertEqual(explicit.returncode,0,explicit.stderr)
 
  def test_compilation_database_arguments_and_explicit_override(self):
   with tempfile.TemporaryDirectory() as temporary:
