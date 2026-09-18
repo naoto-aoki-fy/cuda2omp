@@ -26,8 +26,9 @@ or `LLVM_CONFIG` for another location or a staged package.
 The installed resource layout is deliberately split between public and
 compiler-private files:
 
-* `${PREFIX}/include/cuda2omp_runtime.hpp` is the public compatibility/runtime
-  header used to compile translated output.
+* `${PREFIX}/include/cuda2omp_runtime.hpp` is the runtime used to compile
+  translated output. `${PREFIX}/include/cuda_runtime.h` is an installable,
+  CPU-only subset of the CUDA Runtime API for small host programs.
 * `${PREFIX}/lib/cuda2omp/` contains `cuda_frontend_shim.hpp` and future
   frontend compatibility headers. These are implementation details consumed
   by the driver, not headers translated programs should include.
@@ -113,6 +114,9 @@ the effective working directory and shell-escaped frontend command.
   to every logical thread. CUDA indices live in an explicit `ThreadContext`.
 * `launch` uses `#pragma omp parallel for` only over blocks. Scheduler and shared
   state are block-local, so concurrent blocks do not share bookkeeping.
+* Kernel launches and the host-memory implementations in `cuda_runtime.h` are
+  synchronous. Streams initially have sequential ordering semantics only; no
+  asynchronous execution or operation overlap is provided.
 
 ## Supported subset
 

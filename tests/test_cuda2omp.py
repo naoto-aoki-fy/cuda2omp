@@ -13,7 +13,9 @@ class Tests(unittest.TestCase):
    driver=stage/'usr/bin/cuda2omp'
    resource=stage/'usr/lib/cuda2omp/cuda_frontend_shim.hpp'
    public=stage/'usr/include/cuda2omp_runtime.hpp'
+   compatibility=stage/'usr/include/cuda_runtime.h'
    self.assertTrue(driver.is_file()); self.assertTrue(resource.is_file()); self.assertTrue(public.is_file())
+   self.assertTrue(compatibility.is_file())
    source=work/'input.cu'; output=work/'output.cpp'; executable=work/'program'
    source.write_text('__global__ void set(int*x){x[threadIdx.x]=7;} '
                      'int main(){int x[1]={};set<<<1,1>>>(x);return x[0]!=7;}\n')
@@ -39,6 +41,69 @@ class Tests(unittest.TestCase):
                             str(source),'-o',str(output)],cwd=work,env=env,
                            text=True,capture_output=True)
    self.assertEqual(explicit.returncode,0,explicit.stderr)
+
+ def test_cpu_cuda_runtime_api_and_error_state(self):
+  code=r'''
+   #include <cuda_runtime.h>
+   #include <cstring>
+   #include <thread>
+   int main() {
+     static_assert(cudaSuccess == 0);
+     dim3 extent(2, 3); if (extent.x != 2 || extent.y != 3 || extent.z != 1) return 1;
+     int source[3]={4,5,6}; int *copy=nullptr;
+     if (cudaMalloc(reinterpret_cast<void **>(&copy), sizeof source) != cudaSuccess) return 2;
+     if (cudaMemcpy(copy, source, sizeof source, cudaMemcpyHostToDevice) != cudaSuccess) return 3;
+     if (std::memcmp(copy, source, sizeof source)) return 4;
+     if (cudaMemset(copy, 0, sizeof source) != cudaSuccess || copy[1] != 0) return 5;
+     if (cudaDeviceSynchronize() != cudaSuccess || cudaFree(copy) != cudaSuccess) return 6;
+     if (cudaMemcpy(nullptr, source, 1, cudaMemcpyHostToHost) != cudaErrorInvalidValue) return 7;
+     if (cudaPeekAtLastError() != cudaErrorInvalidValue) return 8;
+     cudaError_t thread_error=cudaSuccess;
+     std::thread worker([&]{ cudaMemset(nullptr, 0, 1); thread_error=cudaPeekAtLastError(); });
+     worker.join();
+     if (thread_error != cudaErrorInvalidValue || cudaPeekAtLastError() != cudaErrorInvalidValue) return 9;
+     if (cudaGetLastError() != cudaErrorInvalidValue || cudaPeekAtLastError() != cudaSuccess) return 10;
+     if (cudaMemcpy(nullptr, nullptr, 0, (cudaMemcpyKind)99) != cudaErrorInvalidMemcpyDirection) return 11;
+     if (std::strcmp(cudaGetErrorString(cudaErrorMemoryAllocation), "out of memory")) return 12;
+   }
+  '''
+  with tempfile.TemporaryDirectory() as temporary:
+   directory=pathlib.Path(temporary); source=directory/'api.cpp'; program=directory/'api'
+   source.write_text(textwrap.dedent(code))
+   compiled=subprocess.run(['clang++','-std=c++20','-pthread','-I',str(ROOT/'runtime'),
+                            str(source),'-o',str(program)],text=True,capture_output=True)
+   self.assertEqual(compiled.returncode,0,compiled.stderr)
+   run=subprocess.run([str(program)],text=True,capture_output=True)
+   self.assertEqual(run.returncode,0,run.stderr)
+
+ def test_cpu_cuda_runtime_rejects_invalid_and_overflowing_operations(self):
+  code=r'''
+   #include <cuda_runtime.h>
+   #include <stdint.h>
+   int main() {
+     char value=1; void *allocation=&value;
+     if (cudaMalloc(nullptr, 1) != cudaErrorInvalidValue) return 1;
+     if (cudaMalloc(&allocation, (size_t)PTRDIFF_MAX + 1) != cudaErrorInvalidValue) return 2;
+     if (allocation != &value) return 3;
+     if (cudaMemset(nullptr, 0, 1) != cudaErrorInvalidValue) return 4;
+     if (cudaMemcpy(&value, nullptr, 1, cudaMemcpyDefault) != cudaErrorInvalidValue) return 5;
+     if (cudaMemset(nullptr, 0, 0) != cudaSuccess) return 6;
+     if (cudaMemcpy(nullptr, nullptr, 0, cudaMemcpyHostToHost) != cudaSuccess) return 7;
+   }
+  '''
+  with tempfile.TemporaryDirectory() as temporary:
+   directory=pathlib.Path(temporary); source=directory/'negative.cpp'; program=directory/'negative'
+   source.write_text(textwrap.dedent(code))
+   compiled=subprocess.run(['clang++','-std=c++20','-I',str(ROOT/'runtime'),str(source),
+                            '-o',str(program)],text=True,capture_output=True)
+   self.assertEqual(compiled.returncode,0,compiled.stderr)
+   run=subprocess.run([str(program)],text=True,capture_output=True)
+   self.assertEqual(run.returncode,0,run.stderr)
+
+ def test_frontend_shim_uses_public_runtime_declarations(self):
+  shim=(ROOT/'runtime/cuda_frontend_shim.hpp').read_text()
+  self.assertIn('#include "cuda_runtime.h"',shim)
+  self.assertNotIn('struct dim3',shim)
 
  def test_compilation_database_arguments_and_explicit_override(self):
   with tempfile.TemporaryDirectory() as temporary:

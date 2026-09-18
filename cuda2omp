@@ -26,6 +26,16 @@ def frontend_shim(directory):
             "or CUDA2OMP_RESOURCE_DIR")
     return shim
 
+def compatibility_include_directory(shim):
+    """Find the authoritative public declarations used by the parse shim."""
+    candidates=(shim.parent, shim.parent.parent.parent/"include")
+    for candidate in candidates:
+        if (candidate/"cuda_runtime.h").is_file():
+            return candidate
+    raise SystemExit(
+        "cuda2omp: required compatibility header 'cuda_runtime.h' not found "
+        f"beside {shim} or in the installation include directory")
+
 def loc(n, which):
     x = n["range"][which]
     x = x.get("expansionLoc", x)
@@ -332,7 +342,9 @@ def ast(source, clang, shim, database_arguments=(), explicit_arguments=(), direc
             continue
         filtered.append(argument); i+=1
     database_arguments=filtered
+    compatibility_include=compatibility_include_directory(shim)
     required=["-x","cuda","--cuda-host-only","-nocudainc","-nocudalib",
+              "-I",str(compatibility_include),
               "-include",str(shim),"-Xclang","-ast-dump=json","-fsyntax-only"]
     cmd=[clang]+database_arguments+explicit_arguments+required+[str(source)]
     if verbose:

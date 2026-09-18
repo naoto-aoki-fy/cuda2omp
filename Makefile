@@ -8,7 +8,7 @@ CXX ?= c++
 LLVM_CONFIG ?= llvm-config
 BUILD_DIR ?= build
 NATIVE_TOOL := $(BUILD_DIR)/cuda2omp-tool
-PUBLIC_HEADERS := runtime/cuda2omp_runtime.hpp
+PUBLIC_HEADERS := runtime/cuda2omp_runtime.hpp runtime/cuda_runtime.h
 COMPATIBILITY_HEADERS := $(wildcard runtime/*_shim.hpp)
 HAVE_LLVM_CONFIG := $(shell command -v "$(LLVM_CONFIG)" >/dev/null 2>&1 && echo yes)
 
