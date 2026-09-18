@@ -1,8 +1,61 @@
 #!/usr/bin/env python3
-import pathlib, subprocess, tempfile, textwrap, unittest
+import json, pathlib, shlex, subprocess, tempfile, textwrap, unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 
 class Tests(unittest.TestCase):
+ def test_compilation_database_arguments_and_explicit_override(self):
+  with tempfile.TemporaryDirectory() as temporary:
+   root=pathlib.Path(temporary)/'project with spaces'
+   source_dir=root/'source'; build=root/'build'; includes=root/'relative includes'
+   generated=build/'generated headers'
+   for directory in (source_dir,build,includes,generated): directory.mkdir(parents=True,exist_ok=True)
+   (includes/'config.hpp').write_text('#define FROM_RELATIVE_INCLUDE 1\n')
+   (generated/'generated.hpp').write_text('#define FROM_GENERATED_INCLUDE 1\n')
+   source=source_dir/'kernel file.cu'
+   source.write_text(textwrap.dedent('''
+    #include "config.hpp"
+    #include "generated.hpp"
+    #if VALUE != 9 || !FROM_RELATIVE_INCLUDE || !FROM_GENERATED_INCLUDE
+    #error compiler arguments were not preserved or overridden
+    #endif
+    __global__ void kernel(int *x) { x[threadIdx.x] = VALUE; }
+    int main() { int x[1]={}; kernel<<<1,1>>>(x); return x[0]==9?0:1; }
+   '''))
+   response=build/'flags.rsp'
+   response.write_text(shlex.join(['-I../relative includes','-Igenerated headers','-DVALUE=7',
+                                   '-std=c++17','-MF','discard.d','-c']))
+   entry={'directory':str(build),'file':'../source/kernel file.cu',
+          'arguments':['clang++','@flags.rsp','../source/kernel file.cu','-o','old output.o']}
+   (build/'compile_commands.json').write_text(json.dumps([entry]))
+   output=root/'result file.cpp'
+   command=[str(ROOT/'cuda2omp'),'-p',str(build),'-v',str(source),'-o',str(output),
+            '--','-DVALUE=9','-std=c++20']
+   result=subprocess.run(command,text=True,capture_output=True)
+   self.assertEqual(result.returncode,0,result.stderr)
+   self.assertTrue(output.is_file())
+   self.assertIn('frontend cwd='+str(build),result.stderr)
+   invocation=next(line for line in result.stderr.splitlines()
+                   if line.startswith('cuda2omp: frontend ') and ' cwd=' not in line)
+   self.assertIn("'-I../relative includes'",invocation)
+   self.assertIn("'-Igenerated headers'",invocation)
+   self.assertIn('-DVALUE=9',invocation)
+   self.assertNotIn('-DVALUE=7',invocation)
+   self.assertNotIn('discard.d',invocation)
+   self.assertNotIn('old output.o',invocation)
+
+ def test_compilation_database_missing_and_ambiguous_diagnostics(self):
+  with tempfile.TemporaryDirectory() as temporary:
+   root=pathlib.Path(temporary); source=root/'input.cu'; source.write_text('int main(){}\n')
+   database=root/'compile_commands.json'
+   for entries,message in (([], 'no compile_commands.json entry'),
+                           ([{'directory':str(root),'file':'input.cu','arguments':['clang++','input.cu']}]*2,
+                            'ambiguous compile_commands.json entries')):
+    database.write_text(json.dumps(entries))
+    result=subprocess.run([str(ROOT/'cuda2omp'),'-p',str(root),str(source),'-o',str(root/'out.cpp')],
+                          text=True,capture_output=True)
+    self.assertNotEqual(result.returncode,0)
+    self.assertIn(message,result.stderr)
+
  def test_native_frontend_contract(self):
   source=(ROOT/'native/cuda2omp_tool.cpp').read_text()
   makefile=(ROOT/'Makefile').read_text()

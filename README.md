@@ -47,6 +47,32 @@ primitive rather than the CUDA lowering interface.
 The emitted `.cpp` is the requested inspectable intermediate form. Set `CLANG`
 or pass `--clang` to select a compatible Clang with CUDA parsing support.
 
+### Compilation databases and frontend arguments
+
+The production driver follows the usual LibTooling command-line shape. Pass
+`-p <build-directory>` to select a `compile_commands.json`, and place explicit
+frontend arguments after `--`:
+
+```sh
+./cuda2omp -p build source/kernel.cu -o kernel.cpp -- -DDEBUG=1 -std=c++20
+```
+
+The input path is resolved against every database entry (including entries
+whose `file` is relative to that entry's `directory`). Exactly one entry must
+match. Relative include paths, response files, and all frontend execution use
+the matched entry's working directory. Missing and duplicate matches are
+reported rather than silently choosing a command.
+
+Database options form the base command. Explicit arguments are then overlaid:
+language-standard, target, language, and same-name `-D`/`-U` options replace
+their database equivalents, while additive options such as include paths are
+preserved. Finally cuda2omp appends its required CUDA language, host-only,
+SDK-independent, forced-shim, JSON AST, and syntax-only options, so those
+cannot be disabled by either earlier source. Compiler inputs and options that
+write compiler output (`-o`, dependency/diagnostic outputs, compile/preprocess
+actions, and AST dump/print/view options) are removed. Use `--verbose` to print
+the effective working directory and shell-escaped frontend command.
+
 ## Execution model and implementation map
 
 * `cuda2omp` consumes Clang's JSON AST. CUDA attributes identify kernels and

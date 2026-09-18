@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """AST-directed CUDA-to-C++20 coroutine prototype."""
-import argparse, json, os, pathlib, subprocess, sys, tempfile
+import argparse, json, os, pathlib, shlex, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent
 SHIM = ROOT / "runtime" / "cuda_frontend_shim.hpp"
@@ -213,10 +213,111 @@ def validate(tree, src, filename):
             print(f"{path}:{line}:{col}: error: {message}",file=sys.stderr)
         raise SystemExit(1)
 
-def ast(source, clang):
-    cmd=[clang,"-std=c++20","-x","cuda","--cuda-host-only","-nocudainc","-nocudalib",
-         "-include",str(SHIM),"-Xclang","-ast-dump=json","-fsyntax-only",source]
-    p=subprocess.run(cmd,text=True,capture_output=True)
+def _expand_response_files(arguments, directory, seen=None):
+    """Expand compiler response files so unsafe output options cannot hide in one."""
+    result=[]; seen=set() if seen is None else seen
+    for argument in arguments:
+        if not argument.startswith("@") or argument == "@":
+            result.append(argument); continue
+        path=pathlib.Path(argument[1:])
+        if not path.is_absolute(): path=directory/path
+        path=path.resolve()
+        if path in seen:
+            raise SystemExit(f"cuda2omp: recursive response file: {path}")
+        try: contents=path.read_text()
+        except OSError as error: raise SystemExit(f"cuda2omp: cannot read response file {path}: {error}")
+        seen.add(path)
+        result.extend(_expand_response_files(shlex.split(contents),directory,seen))
+        seen.remove(path)
+    return result
+
+def _option_key(argument):
+    """Options for which a command-line override supersedes the database value."""
+    for prefix in ("-std=", "--std="):
+        if argument.startswith(prefix): return "standard"
+    for prefix in ("--target=", "-target="):
+        if argument.startswith(prefix): return "target"
+    if argument.startswith("-D") or argument.startswith("-U"):
+        return "macro:"+argument[2:].split("=",1)[0]
+    if argument in ("-x", "-target", "--target"): return argument.lstrip("-")
+    return None
+
+def _strip_compiler_actions(arguments, source):
+    """Keep parsing configuration, but remove inputs and output-producing actions."""
+    result=[]; i=0; source=pathlib.Path(source).resolve()
+    takes_value={"-o", "-MF", "-MT", "-MQ", "-MJ", "-dependency-file",
+                 "--dependency-file", "-serialize-diagnostics"}
+    actions={"-c", "-S", "-E", "--precompile", "-emit-ast", "-fsyntax-only",
+             "-MD", "-MMD", "-MG", "-MP", "-save-temps", "--save-temps"}
+    joined=("-o", "-MF", "-MT", "-MQ", "-MJ", "-dependency-file=",
+            "--dependency-file=", "-serialize-diagnostics=")
+    while i < len(arguments):
+        arg=arguments[i]
+        if arg in takes_value:
+            i+=2; continue
+        if arg in actions or any(arg.startswith(p) and arg != p for p in joined):
+            i+=1; continue
+        if arg == "-Xclang" and i+1 < len(arguments) and (
+                "ast-dump" in arguments[i+1] or arguments[i+1] in
+                ("-emit-ast", "-ast-print", "-ast-view")):
+            i+=2; continue
+        if "ast-dump" in arg:
+            i+=1; continue
+        try: is_source=not arg.startswith("-") and pathlib.Path(arg).resolve()==source
+        except OSError: is_source=False
+        if not is_source: result.append(arg)
+        i+=1
+    return result
+
+def _database_command(build_directory, source):
+    database=pathlib.Path(build_directory)/"compile_commands.json"
+    try: entries=json.loads(database.read_text())
+    except OSError as error: raise SystemExit(f"cuda2omp: cannot read {database}: {error}")
+    except json.JSONDecodeError as error: raise SystemExit(f"cuda2omp: invalid {database}: {error}")
+    source=pathlib.Path(source).resolve(); matches=[]
+    for entry in entries:
+        directory=pathlib.Path(entry.get("directory", build_directory)).resolve()
+        candidate=pathlib.Path(entry.get("file", ""))
+        if not candidate.is_absolute(): candidate=directory/candidate
+        if candidate.resolve() == source: matches.append((entry,directory))
+    if not matches:
+        raise SystemExit(f"cuda2omp: no compile_commands.json entry for {source}")
+    if len(matches) != 1:
+        raise SystemExit(f"cuda2omp: ambiguous compile_commands.json entries for {source} ({len(matches)} matches)")
+    entry,directory=matches[0]
+    arguments=entry.get("arguments")
+    if arguments is None:
+        try: arguments=shlex.split(entry["command"])
+        except (KeyError,ValueError) as error: raise SystemExit(f"cuda2omp: invalid compile command for {source}: {error}")
+    if not arguments: raise SystemExit(f"cuda2omp: empty compile command for {source}")
+    arguments=_expand_response_files(list(arguments[1:]),directory)
+    # Resolve positional inputs in the command's own working directory.
+    arguments=[a for a in arguments if a.startswith("-") or
+               (directory/pathlib.Path(a)).resolve() != source]
+    return directory, arguments
+
+def ast(source, clang, database_arguments=(), explicit_arguments=(), directory=None, verbose=False):
+    database_arguments=_strip_compiler_actions(database_arguments,source)
+    explicit_arguments=_strip_compiler_actions(explicit_arguments,source)
+    # Explicit arguments are an overlay: options with a unique semantic key
+    # replace their database counterpart; additive options (notably -I) remain.
+    explicit_keys={k for k in map(_option_key,explicit_arguments) if k}
+    filtered=[]; i=0
+    while i < len(database_arguments):
+        argument=database_arguments[i]; key=_option_key(argument)
+        if key in explicit_keys:
+            # These options spell their value as the following argv element.
+            i += 2 if argument in ("-x", "-target", "--target") else 1
+            continue
+        filtered.append(argument); i+=1
+    database_arguments=filtered
+    required=["-x","cuda","--cuda-host-only","-nocudainc","-nocudalib",
+              "-include",str(SHIM),"-Xclang","-ast-dump=json","-fsyntax-only"]
+    cmd=[clang]+database_arguments+explicit_arguments+required+[str(source)]
+    if verbose:
+        print("cuda2omp: frontend cwd="+str(directory or pathlib.Path.cwd()),file=sys.stderr)
+        print("cuda2omp: frontend "+shlex.join(cmd),file=sys.stderr)
+    p=subprocess.run(cmd,text=True,capture_output=True,cwd=directory)
     if p.returncode:
         sys.stderr.write(p.stderr); raise SystemExit("cuda2omp: Clang CUDA parse failed")
     return json.loads(p.stdout)
@@ -298,8 +399,23 @@ def transform_body(src, body, declarations, function_names, shared_names, ret):
 def main():
     ap=argparse.ArgumentParser(description="Lower a restricted CUDA TU to CPU C++20/OpenMP")
     ap.add_argument("input"); ap.add_argument("-o","--output",required=True)
+    ap.add_argument("-p",dest="build_directory",metavar="BUILD_DIRECTORY",
+                    help="read BUILD_DIRECTORY/compile_commands.json")
+    ap.add_argument("-v","--verbose",action="store_true",
+                    help="print the final Clang frontend invocation")
     ap.add_argument("--clang",default=os.environ.get("CLANG","clang++"))
-    ns=ap.parse_args(); src=pathlib.Path(ns.input).read_text(); tree=ast(ns.input,ns.clang)
+    own,trailing=(sys.argv[1:],[])
+    if "--" in own:
+        split=own.index("--"); own,trailing=own[:split],own[split+1:]
+    ns=ap.parse_args(own); input_path=pathlib.Path(ns.input).resolve()
+    directory=None; database_arguments=[]
+    if ns.build_directory:
+        directory,database_arguments=_database_command(ns.build_directory,input_path)
+    if directory is None: directory=pathlib.Path.cwd()
+    trailing=_expand_response_files(trailing,directory)
+    src=input_path.read_text()
+    tree=ast(input_path,ns.clang,database_arguments,trailing,directory,ns.verbose)
+    ns.input=str(input_path)
     validate(tree,src,ns.input)
     declarations=Declarations(tree)
     cuda_decls=[]
