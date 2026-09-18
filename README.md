@@ -19,8 +19,25 @@ replacement is developed. When LLVM and Clang development packages are
 available, `make` directly builds `build/cuda2omp-tool`, the C++ LibTooling
 parsing and rewrite layer. The build uses `llvm-config` for compiler and linker
 flags and does not require CMake. Use `make install` to install the available
-tools and runtime header under `/usr/local`, or override `PREFIX`, `DESTDIR`,
-`CXX`, or `LLVM_CONFIG` for another location or a staged package.
+tools and headers under `/usr/local`, or override `PREFIX`, `DESTDIR`, `CXX`,
+or `LLVM_CONFIG` for another location or a staged package.
+
+The installed resource layout is deliberately split between public and
+compiler-private files:
+
+* `${PREFIX}/include/cuda2omp_runtime.hpp` is the public compatibility/runtime
+  header used to compile translated output.
+* `${PREFIX}/lib/cuda2omp/` contains `cuda_frontend_shim.hpp` and future
+  frontend compatibility headers. These are implementation details consumed
+  by the driver, not headers translated programs should include.
+
+An installed driver finds the private directory relative to its own
+`${PREFIX}/bin/cuda2omp` path, so both relocated installations and `DESTDIR`
+staging work without recording the staging root. `--resource-dir DIRECTORY`
+overrides that lookup; `CUDA2OMP_RESOURCE_DIR` provides the same override when
+the option is absent. The driver checks for `cuda_frontend_shim.hpp` before
+starting Clang and reports the searched directory and both override mechanisms
+if the installation is incomplete. Source-tree runs fall back to `runtime/`.
 
 ## Native parsing and rewrite layer
 

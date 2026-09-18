@@ -3,7 +3,27 @@
 import argparse, json, os, pathlib, shlex, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent
-SHIM = ROOT / "runtime" / "cuda_frontend_shim.hpp"
+
+def resource_directory(override=None):
+    """Locate compiler-private headers, preferring explicit configuration."""
+    configured=override or os.environ.get("CUDA2OMP_RESOURCE_DIR")
+    if configured:
+        return pathlib.Path(configured).expanduser().resolve()
+    # Installed executables live in PREFIX/bin and resources in
+    # PREFIX/lib/cuda2omp.  The source-tree fallback keeps development runs
+    # useful without baking the checkout or DESTDIR into installed scripts.
+    installed=(ROOT.parent/"lib"/"cuda2omp").resolve()
+    source_resources=ROOT/"runtime"
+    return source_resources if (source_resources/"cuda_frontend_shim.hpp").is_file() else installed
+
+def frontend_shim(directory):
+    shim=directory/"cuda_frontend_shim.hpp"
+    if not shim.is_file():
+        raise SystemExit(
+            f"cuda2omp: required frontend resource 'cuda_frontend_shim.hpp' "
+            f"not found in resource directory {directory}; set --resource-dir "
+            "or CUDA2OMP_RESOURCE_DIR")
+    return shim
 
 def loc(n, which):
     x = n["range"][which]
@@ -296,7 +316,7 @@ def _database_command(build_directory, source):
                (directory/pathlib.Path(a)).resolve() != source]
     return directory, arguments
 
-def ast(source, clang, database_arguments=(), explicit_arguments=(), directory=None, verbose=False):
+def ast(source, clang, shim, database_arguments=(), explicit_arguments=(), directory=None, verbose=False):
     database_arguments=_strip_compiler_actions(database_arguments,source)
     explicit_arguments=_strip_compiler_actions(explicit_arguments,source)
     # Explicit arguments are an overlay: options with a unique semantic key
@@ -312,7 +332,7 @@ def ast(source, clang, database_arguments=(), explicit_arguments=(), directory=N
         filtered.append(argument); i+=1
     database_arguments=filtered
     required=["-x","cuda","--cuda-host-only","-nocudainc","-nocudalib",
-              "-include",str(SHIM),"-Xclang","-ast-dump=json","-fsyntax-only"]
+              "-include",str(shim),"-Xclang","-ast-dump=json","-fsyntax-only"]
     cmd=[clang]+database_arguments+explicit_arguments+required+[str(source)]
     if verbose:
         print("cuda2omp: frontend cwd="+str(directory or pathlib.Path.cwd()),file=sys.stderr)
@@ -404,17 +424,21 @@ def main():
     ap.add_argument("-v","--verbose",action="store_true",
                     help="print the final Clang frontend invocation")
     ap.add_argument("--clang",default=os.environ.get("CLANG","clang++"))
+    ap.add_argument("--resource-dir", metavar="DIRECTORY",
+                    help="directory containing compiler-private cuda2omp headers "
+                         "(overrides CUDA2OMP_RESOURCE_DIR)")
     own,trailing=(sys.argv[1:],[])
     if "--" in own:
         split=own.index("--"); own,trailing=own[:split],own[split+1:]
     ns=ap.parse_args(own); input_path=pathlib.Path(ns.input).resolve()
+    shim=frontend_shim(resource_directory(ns.resource_dir))
     directory=None; database_arguments=[]
     if ns.build_directory:
         directory,database_arguments=_database_command(ns.build_directory,input_path)
     if directory is None: directory=pathlib.Path.cwd()
     trailing=_expand_response_files(trailing,directory)
     src=input_path.read_text()
-    tree=ast(input_path,ns.clang,database_arguments,trailing,directory,ns.verbose)
+    tree=ast(input_path,ns.clang,shim,database_arguments,trailing,directory,ns.verbose)
     ns.input=str(input_path)
     validate(tree,src,ns.input)
     declarations=Declarations(tree)

@@ -1,11 +1,15 @@
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 INCLUDEDIR ?= $(PREFIX)/include
+LIBDIR ?= $(PREFIX)/lib
+RESOURCE_DIR ?= $(LIBDIR)/cuda2omp
 PYTHON ?= python3
 CXX ?= c++
 LLVM_CONFIG ?= llvm-config
 BUILD_DIR ?= build
 NATIVE_TOOL := $(BUILD_DIR)/cuda2omp-tool
+PUBLIC_HEADERS := runtime/cuda2omp_runtime.hpp
+COMPATIBILITY_HEADERS := $(wildcard runtime/*_shim.hpp)
 HAVE_LLVM_CONFIG := $(shell command -v "$(LLVM_CONFIG)" >/dev/null 2>&1 && echo yes)
 
 .PHONY: all native test check install clean
@@ -31,10 +35,11 @@ test check:
 	$(PYTHON) tests/test_cuda2omp.py
 
 install:
-	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(INCLUDEDIR)"
+	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(INCLUDEDIR)" \
+		"$(DESTDIR)$(RESOURCE_DIR)"
 	install -m 755 cuda2omp "$(DESTDIR)$(BINDIR)/cuda2omp"
-	install -m 644 runtime/cuda2omp_runtime.hpp \
-		"$(DESTDIR)$(INCLUDEDIR)/cuda2omp_runtime.hpp"
+	install -m 644 $(PUBLIC_HEADERS) "$(DESTDIR)$(INCLUDEDIR)/"
+	install -m 644 $(COMPATIBILITY_HEADERS) "$(DESTDIR)$(RESOURCE_DIR)/"
 	@if test -x "$(NATIVE_TOOL)"; then \
 		install -m 755 "$(NATIVE_TOOL)" "$(DESTDIR)$(BINDIR)/cuda2omp-tool"; \
 	fi

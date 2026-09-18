@@ -1,8 +1,38 @@
 #!/usr/bin/env python3
-import json, pathlib, shlex, subprocess, tempfile, textwrap, unittest
+import json, os, pathlib, shlex, subprocess, tempfile, textwrap, unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 
 class Tests(unittest.TestCase):
+ def test_staged_install_is_self_contained(self):
+  with tempfile.TemporaryDirectory() as temporary:
+   stage=pathlib.Path(temporary)/'stage'; work=pathlib.Path(temporary)/'work'
+   work.mkdir()
+   install=subprocess.run(['make','install','PREFIX=/usr','DESTDIR='+str(stage)],
+                          cwd=ROOT,text=True,capture_output=True)
+   self.assertEqual(install.returncode,0,install.stderr)
+   driver=stage/'usr/bin/cuda2omp'
+   resource=stage/'usr/lib/cuda2omp/cuda_frontend_shim.hpp'
+   public=stage/'usr/include/cuda2omp_runtime.hpp'
+   self.assertTrue(driver.is_file()); self.assertTrue(resource.is_file()); self.assertTrue(public.is_file())
+   source=work/'input.cu'; output=work/'output.cpp'; executable=work/'program'
+   source.write_text('__global__ void set(int*x){x[threadIdx.x]=7;} '
+                     'int main(){int x[1]={};set<<<1,1>>>(x);return x[0]!=7;}\n')
+   translated=subprocess.run([str(driver),str(source),'-o',str(output)],cwd=work,
+                             text=True,capture_output=True)
+   self.assertEqual(translated.returncode,0,translated.stderr)
+   compiled=subprocess.run(['clang++','-std=c++20','-I',str(stage/'usr/include'),
+                            str(output),'-o',str(executable)],cwd=work,
+                           text=True,capture_output=True)
+   self.assertEqual(compiled.returncode,0,compiled.stderr)
+   run=subprocess.run([str(executable)],cwd=work,text=True,capture_output=True)
+   self.assertEqual(run.returncode,0,run.stderr)
+   env=os.environ.copy(); env['CUDA2OMP_RESOURCE_DIR']=str(work/'missing')
+   missing=subprocess.run([str(driver),str(source),'-o',str(output)],cwd=work,
+                          env=env,text=True,capture_output=True)
+   self.assertNotEqual(missing.returncode,0)
+   self.assertIn("required frontend resource 'cuda_frontend_shim.hpp' not found",missing.stderr)
+   self.assertIn(str(work/'missing'),missing.stderr)
+
  def test_compilation_database_arguments_and_explicit_override(self):
   with tempfile.TemporaryDirectory() as temporary:
    root=pathlib.Path(temporary)/'project with spaces'
